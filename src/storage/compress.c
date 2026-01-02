@@ -1,3 +1,4 @@
+#include "storage.h"
 #include <lz4.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,7 +33,7 @@ int smart_decompress(const char *input, int input_len, char *output, int max_out
     }
     return decompressed_size;
 }
-
+/*
 // 测试函数 (Main)
 int main() {
     // 1. 准备一段数据
@@ -70,4 +71,4 @@ int main() {
     }
 
     return 0;
-}
+}*/

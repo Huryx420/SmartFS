@@ -1,3 +1,4 @@
+#include "storage.h"
 #include <stdio.h>
 #include <string.h>
 #include <openssl/sha.h> 
@@ -17,7 +18,7 @@ void calculate_sha256(const char *input, size_t len, char *output) {
     output[64] = 0; 
 }
 
-int main() {
+/*int main() {
     // 测试一下功能
     const char *data = "SmartFS Storage Engine Test";
     char result[65];
@@ -27,4 +28,4 @@ int main() {
     printf("原始数据: %s\n", data);
     printf("数据指纹: %s\n", result);
     return 0;
-}
+}*/
