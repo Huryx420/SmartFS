@@ -23,7 +23,8 @@ typedef struct {
     uint64_t root_inode;         // 根目录的 Inode 编号
     uint64_t block_bitmap_start; // 位图起始位置
     uint64_t inode_area_start;   // Inode区起始位置
-    uint64_t data_area_start;    // 数据区起始位置
+    uint64_t data_area_start;
+    uint64_t inode_bitmap_start;    // 数据区起始位置
 } super_block_t;
 
 // ---------------------------------------------------------
@@ -68,3 +69,12 @@ typedef struct {
 } inode_t;
 
 #endif
+// ---------------------------------------------------------
+// 5. 目录项 (Directory Entry)
+// ---------------------------------------------------------
+// 目录本质上是一个特殊的文件，它的内容就是一堆这种结构体
+typedef struct {
+    char     name[MAX_FILENAME]; // 文件名 (例如 "homework.doc")
+    uint64_t inode_no;           // 对应的 Inode 编号
+    uint8_t  is_valid;           // 1=有效，0=已删除
+} smartfs_dir_entry_t;

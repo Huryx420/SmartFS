@@ -43,7 +43,44 @@ static int smartfs_getattr(const char *path, struct stat *stbuf,
 
     return res;
 }
+// 3. 读取目录内容 (readdir)
+// 当用户执行 ls 时调用
+static int smartfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
+                         off_t offset, struct fuse_file_info *fi,
+                         enum fuse_readdir_flags flags)
+{
+    (void) offset; (void) fi; (void) flags;
 
+    // 目前我们只支持根目录 "/"
+    if (strcmp(path, "/") != 0)
+        return -ENOENT;
+
+    // 计算根目录数据块在磁盘的位置
+    // 注意：这里逻辑要和 mkfs.c 保持一致
+    off_t data_offset = sb.data_area_start * BLOCK_SIZE;
+    
+    // 申请一块内存来读取数据
+    smartfs_dir_entry_t *entries = malloc(BLOCK_SIZE);
+    
+    // 从磁盘读取
+    lseek(disk_fd, data_offset, SEEK_SET);
+    read(disk_fd, entries, BLOCK_SIZE);
+
+    // 遍历这块数据，找到有效的目录项
+    // 假设一个块能存 BLOCK_SIZE / sizeof(entry) 个项
+    int max_entries = BLOCK_SIZE / sizeof(smartfs_dir_entry_t);
+    
+    for (int i = 0; i < max_entries; i++) {
+        if (entries[i].is_valid) {
+            // filler 是 FUSE 提供的回调函数，用来把文件名填回去
+            // 参数：buf, 文件名, stat结构(NULL), 偏移(0)
+            filler(buf, entries[i].name, NULL, 0, 0);
+        }
+    }
+
+    free(entries);
+    return 0;
+}
 // 2. 统计文件系统信息 (statfs)
 // 当你运行 df -h 时，会调用这个函数
 static int smartfs_statfs(const char *path, struct statvfs *stbuf)
@@ -60,7 +97,8 @@ static int smartfs_statfs(const char *path, struct statvfs *stbuf)
 
 static const struct fuse_operations smartfs_oper = {
     .getattr = smartfs_getattr,
-    .statfs  = smartfs_statfs, // 新增：支持 df 命令查看容量
+    .statfs  = smartfs_statfs, 
+    .readdir = smartfs_readdir,// 新增：支持 df 命令查看容量
 };
 
 // ---------------------------------------------------------
