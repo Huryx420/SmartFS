@@ -26,4 +26,7 @@ int smart_write(long inode_id, long offset, const char *data, int len);
 void lru_init(int capacity);
 void lru_put(int block_id, const char *data, int len);
 char* lru_get(int block_id);
+// 智能读取函数
+// 返回：实际读取的字节数
+int smart_read(long inode_id, long offset, char *buffer, int size);
 #endif

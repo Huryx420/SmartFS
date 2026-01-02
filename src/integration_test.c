@@ -5,21 +5,23 @@
 
 // 修改 integration_test.c 的 main 函数
 int main() {
-    printf("========== SmartFS 智能写入逻辑测试 ==========\n");
+    printf("========== SmartFS 全链路集成测试 ==========\n");
+    
+    // 1. 初始化缓存
+    lru_init(5);
 
-    const char *data1 = "Hello SmartFS! This is a duplicate test.";
-    const char *data2 = "Hello World! This is different data.";
-    const char *data3 = "Hello SmartFS! This is a duplicate test."; // 注意：data3 和 data1 一模一样
+    const char *data = "This is hot data!";
+    int len = strlen(data);
 
-    // 第一次写入 data1
-    smart_write(101, 0, data1, strlen(data1));
+    // 2. 写入数据 (预期：会触发 lru_put)
+    printf("\n--- 步骤1: 写入数据 ---\n");
+    smart_write(101, 0, data, len);
 
-    // 第二次写入 data2 (内容不同)
-    smart_write(101, 100, data2, strlen(data2));
-
-    // 第三次写入 data3 (内容和 data1 一样)
-    // 预期：程序应该检测到重复，不执行写入
-    smart_write(101, 200, data3, strlen(data3));
+    // 3. 马上读取 (预期：应该命中缓存，速度极快)
+    printf("\n--- 步骤2: 读取数据 ---\n");
+    char read_buf[100];
+    // 这里的 offset 0 对应我们在 smart_read 里模拟的 block_id 1
+    smart_read(101, 0, read_buf, len); 
 
     return 0;
 }
