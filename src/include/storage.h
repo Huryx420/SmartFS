@@ -16,5 +16,10 @@ int smart_compress(const char *input, int input_len, char *output);
 // 3. 智能解压 (来自 compress.c)
 // 返回解压后的长度
 int smart_decompress(const char *input, int input_len, char *output, int max_output_len);
+// === 模块 C 核心业务接口 ===
 
+// 智能写入函数 (总指挥)
+// 参数: inode_id(这是哪个文件的), offset(写在哪), data(数据), len(长度)
+// 返回: 实际写入的字节数
+int smart_write(long inode_id, long offset, const char *data, int len);
 #endif
