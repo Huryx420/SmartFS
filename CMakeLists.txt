@@ -2,30 +2,31 @@ cmake_minimum_required(VERSION 3.10)
 project(SmartFS)
 
 set(CMAKE_C_STANDARD 11)
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra") # 开启警告，减少Bug
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra")
 
 # 1. 查找依赖库
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FUSE3 REQUIRED fuse3)
-pkg_check_modules(LIBS REQUIRED libzstd liblz4 libssl) # 预留给压缩和加密库
+# pkg_check_modules(LIBS REQUIRED libzstd liblz4 libssl) # 暂时注释掉，用到再开
 
-# 2. 设置头文件路径
+# 2. 【关键修复】设置正确的头文件路径
+# 指向 src/include 而不是 include
 include_directories(
     ${FUSE3_INCLUDE_DIRS}
-    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/src/include
 )
 
-# 3. 自动查找 src 目录下的所有 .c 文件
-# (注意：正式开发时通常建议手动列出，但初期为了方便先自动查找)
-file(GLOB_RECURSE SOURCES "src/*.c")
+# 3. 定义主程序 smartfs (排除 mkfs.c)
+# 注意：这里我们手动指定 main.c，防止把 mkfs.c 混进去
+add_executable(smartfs src/main.c)
 
-# 4. 生成可执行文件
-add_executable(smartfs ${SOURCES})
-
-# 5. 链接库文件
 target_link_libraries(smartfs 
     ${FUSE3_LIBRARIES}
-    ${LIBS_LIBRARIES}
-    m # 数学库
-    pthread # 线程库
+    # ${LIBS_LIBRARIES}
+    m
+    pthread
 )
+
+# 4. 定义格式化工具 mkfs
+add_executable(mkfs src/utils/mkfs.c)
+# mkfs 不需要链接 FUSE 库，只需要基础的 C 库即可
