@@ -9,6 +9,11 @@
 #include <stdlib.h>
 #include <time.h>
 #include "smartfs_types.h"
+#include <sys/types.h>
+#include <sys/stat.h>
+// [新增] 引入版本管理模块
+#include "versioning/version_mgr.h"
+#include "versioning/version_utils.h"
 
 // 全局变量
 static int disk_fd = -1;
@@ -185,9 +190,17 @@ void free_inode(uint64_t inode_id) {
 // 辅助工具：解析路径并找到对应的 Inode ID
 // 支持 /file 和 /dir/file
 // ---------------------------------------------------------
+// [修改] 升级后的路径解析 (支持 @ 版本后缀)
 uint64_t resolve_path_to_inode(const char *path) {
+    // 1. 先分离版本号
+    char real_path[MAX_FILENAME];
+    int version_id_dummy;
+    parse_version_path(path, real_path, &version_id_dummy); 
+    // 注意：这里我们只关心 inode 对应的文件名，具体的 version_id 留给 read/write 处理
+
+    // 2. 解析父目录和文件名 (使用 real_path)
     char full_path[MAX_FILENAME];
-    strncpy(full_path, path + 1, MAX_FILENAME - 1);
+    strncpy(full_path, real_path + 1, MAX_FILENAME - 1); // 去掉开头的 /
     full_path[MAX_FILENAME - 1] = '\0';
 
     char *dir_name = NULL;
@@ -337,55 +350,94 @@ static int smartfs_create(const char *path, mode_t mode, struct fuse_file_info *
 }
 
 // 4. 写入文件 (write)
+// [修改] 集成快照与CoW的 write
 static int smartfs_write(const char *path, const char *buf, size_t size,
                        off_t offset, struct fuse_file_info *fi) {
     (void) fi;
     
-    // 1. 查找 Inode (支持子目录)
+    // 1. 检查是否试图写入历史版本 (不允许)
+    char real_path[MAX_FILENAME];
+    int version_req;
+    if (parse_version_path(path, real_path, &version_req) == 1) {
+        return -EROFS; // Read-only file system
+    }
+
     uint64_t inode_id = resolve_path_to_inode(path);
     if (inode_id == 0) return -ENOENT;
 
-    // 2. 读取 Inode
     inode_t inode;
     load_inode(inode_id, &inode);
-    file_version_t *v = &inode.versions[0];
 
-    // 3. 分配数据块
-    if (v->block_count == 0) {
-        uint64_t new_block = allocate_block();
-        if (new_block == 0) return -ENOSPC;
-        v->block_list_start_index = new_block;
-        v->block_count = 1;
+    // =========== [Mod B 集成点] ===========
+    // 2. 在写入前，创建快照 (保存当前状态为历史)
+    // 策略：每次写入都生成新版本 (为了演示效果)
+    version_mgr_create_snapshot(&inode, "Auto-save on write");
+    
+    // 3. 获取最新的版本 (这将是我们即将写入的版本)
+    file_version_t *v = version_mgr_get_version(&inode, 0);
+    // =====================================
+
+    // 4. [Copy-on-Write] 写时复制核心逻辑
+    // 为了不覆盖旧版本的数据块，我们必须为新版本分配一个新块
+    // (注意：这里简化处理，假设文件只有1个块。真实系统需要处理块列表)
+    
+    uint64_t old_block = v->block_list_start_index;
+    uint64_t new_block = allocate_block(); // 申请新物理块
+    if (new_block == 0) return -ENOSPC;
+
+    // 如果旧块有数据，先搬运过来 (继承数据)
+    if (old_block != 0) {
+        char temp_buf[BLOCK_SIZE];
+        lseek(disk_fd, old_block * BLOCK_SIZE, SEEK_SET);
+        read(disk_fd, temp_buf, BLOCK_SIZE);
+        
+        lseek(disk_fd, new_block * BLOCK_SIZE, SEEK_SET);
+        write(disk_fd, temp_buf, BLOCK_SIZE);
     }
 
-    // 4. 写入数据
-    uint64_t phys_block = v->block_list_start_index;
-    off_t disk_offset = phys_block * BLOCK_SIZE + offset;
+    // 更新新版本指向新块
+    v->block_list_start_index = new_block;
+    v->block_count = 1;
 
+    // 5. 执行真正的写入 (写入新块)
+    off_t disk_offset = new_block * BLOCK_SIZE + offset;
     lseek(disk_fd, disk_offset, SEEK_SET);
     write(disk_fd, buf, size);
 
-    // 5. 更新大小
+    // 6. 更新文件大小
     if (offset + size > v->file_size) {
         v->file_size = offset + size;
     }
+    
+    // 7. 保存 Inode (必须保存，否则版本信息丢失)
     save_inode(&inode);
 
     return size;
 }
 
 // 5. 读取文件 (read)
+// [修改] 支持读取历史版本的 read
 static int smartfs_read(const char *path, char *buf, size_t size, off_t offset,
                       struct fuse_file_info *fi) {
     (void) fi;
 
-    uint64_t inode_id = resolve_path_to_inode(path);
+    // 1. 解析路径和版本
+    char real_path[MAX_FILENAME];
+    int version_id = 0;
+    parse_version_path(path, real_path, &version_id);
+
+    uint64_t inode_id = resolve_path_to_inode(path); // 这里的 path 可以带 @，上面那个函数已经能处理了
     if (inode_id == 0) return -ENOENT;
 
+    // 2. 读取 Inode
     inode_t inode;
     load_inode(inode_id, &inode);
-    file_version_t *v = &inode.versions[0];
 
+    // 3. [关键] 获取指定版本的指针
+    file_version_t *v = version_mgr_get_version(&inode, version_id);
+    if (!v) return -ENOENT; // 版本不存在
+
+    // 4. 读取数据
     if (offset >= v->file_size) return 0;
     if (offset + size > v->file_size) size = v->file_size - offset;
 
@@ -554,6 +606,8 @@ static int smartfs_rmdir(const char *path) {
 }
 
 static int smartfs_open(const char *path, struct fuse_file_info *fi) {
+    (void) path; // <--- 新增：告诉编译器忽略 path
+    (void) fi;   // <--- 新增：告诉编译器忽略 fi
     return 0;
 }
 
