@@ -22,4 +22,8 @@ int smart_decompress(const char *input, int input_len, char *output, int max_out
 // 参数: inode_id(这是哪个文件的), offset(写在哪), data(数据), len(长度)
 // 返回: 实际写入的字节数
 int smart_write(long inode_id, long offset, const char *data, int len);
+// === LRU 缓存接口 ===
+void lru_init(int capacity);
+void lru_put(int block_id, const char *data, int len);
+char* lru_get(int block_id);
 #endif
