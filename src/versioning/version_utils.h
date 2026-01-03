@@ -1,17 +1,14 @@
 #ifndef VERSION_UTILS_H
 #define VERSION_UTILS_H
 
-/**
- * 解析带有版本号的路径
- * * 示例输入: "/home/docs/report.txt@v3"
- * 输出:
- * real_path: "/home/docs/report.txt"
- * version_id: 3
- * * 返回值: 
- * 0: 普通文件 (无版本号)
- * 1: 历史版本 (有 @vN)
- * -1: 解析错误
- */
-int parse_version_path(const char *path, char *real_path, int *version_id);
+// 解析结果类型
+typedef enum {
+    VER_QUERY_NONE = 0,    // 普通文件
+    VER_QUERY_ID,          // 指定版本号 (v1, v2)
+    VER_QUERY_TIME         // 指定时间 (2h, yesterday)
+} version_query_type_t;
+
+// [修改] 函数原型更新：增加 query_str 用于返回时间字符串
+version_query_type_t parse_version_path(const char *path, char *real_path, int *version_id, char *query_str);
 
 #endif

@@ -1,39 +1,55 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include "version_utils.h"
 
-int parse_version_path(const char *path, char *real_path, int *version_id) {
-    // 1. 查找路径中最后一个 '@' 的位置
+// 辅助函数：判断是否是时间后缀
+// 简单规则：以数字开头且以 h/m/d 结尾，或者等于 "yesterday"
+static int is_time_suffix(const char *suffix) {
+    if (strcmp(suffix, "yesterday") == 0) return 1;
+    
+    // 检查是否是 2h, 30m 格式
+    char *endptr;
+    strtol(suffix, &endptr, 10); // 尝试转换数字
+    if (endptr == suffix) return 0; // 没有数字开头
+    
+    // 检查单位
+    if (strcmp(endptr, "h") == 0 || strcmp(endptr, "m") == 0 || strcmp(endptr, "d") == 0) {
+        return 1;
+    }
+    return 0;
+}
+
+version_query_type_t parse_version_path(const char *path, char *real_path, int *version_id, char *query_str) {
     const char *at_sign = strrchr(path, '@');
     
-    // 情况A: 没有 @，或者 @ 是第一个字符(不合法)，当作普通文件
     if (!at_sign || at_sign == path) {
         strcpy(real_path, path);
-        *version_id = 0;
-        return 0;
+        return VER_QUERY_NONE;
     }
 
-    // 2. 尝试解析版本号
-    // 格式必须严格匹配 @v数字，例如 @v1, @v20
-    int id = 0;
-    // sscanf 返回匹配成功的个数
-    if (sscanf(at_sign, "@v%d", &id) != 1) {
-        // 情况B: 有 @ 但后面不是 v+数字 (比如 email@test.com)
-        // 当作普通文件名处理
-        strcpy(real_path, path);
-        *version_id = 0;
-        return 0;
-    }
-
-    // 情况C: 成功匹配到版本号
-    // 计算真实文件名长度 (从开头到 @ 之前)
+    // 计算文件名长度
     long name_len = at_sign - path;
-    
-    // 复制真实路径
     strncpy(real_path, path, name_len);
-    real_path[name_len] = '\0'; // 手动添加字符串结束符
-    
-    *version_id = id;
-    return 1; // 返回 1 表示这是个历史版本
+    real_path[name_len] = '\0';
+
+    const char *suffix = at_sign + 1; // 跳过 @
+
+    // 1. 尝试解析为版本号 vN
+    if (suffix[0] == 'v' && isdigit(suffix[1])) {
+        if (sscanf(suffix, "v%d", version_id) == 1) {
+            return VER_QUERY_ID;
+        }
+    }
+
+    // 2. 尝试解析为时间表达式
+    if (is_time_suffix(suffix)) {
+        if (query_str) strcpy(query_str, suffix);
+        return VER_QUERY_TIME;
+    }
+
+    // 3. 都不匹配，视为普通文件名包含 @
+    strcpy(real_path, path);
+    return VER_QUERY_NONE;
 }

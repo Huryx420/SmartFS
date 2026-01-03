@@ -10,9 +10,14 @@
 // ---------------------------------------------------------
 #define BLOCK_SIZE 4096          // 块大小 4KB
 #define MAX_FILENAME 255         // 最大文件名长度
-#define MAX_VERSIONS 128         // 每个文件最大保留版本数
+#define MAX_VERSIONS 128        // 每个文件最大保留版本数
 #define HASH_SIZE 32             // SHA-256 哈希值长度
-
+// 1. 定义扩展属性条目结构
+typedef struct {
+    char name[32];   // 属性名 (例如 "user.author")
+    char value[32];  // 属性值 (例如 "leishen")
+    int valid;       // 是否有效
+} xattr_entry_t;
 // ---------------------------------------------------------
 // 1. 超级块 (SuperBlock) - 整个文件系统的“身份证”
 // ---------------------------------------------------------
@@ -42,14 +47,13 @@ typedef struct {
 // 3. 文件版本 (File Version) - 透明版本管理的核心
 // ---------------------------------------------------------
 typedef struct {
-    uint32_t version_id;         // 版本号 (v1, v2...)
-    time_t   timestamp;          // 创建时间
-    char     commit_msg[128];    // 修改说明 (例如 "Auto backup")
-    uint64_t file_size;          // 这个版本的文件大小
-    uint32_t block_count;        // 这个版本用了多少个块
-    // 柔性数组：存储该版本所有数据块的索引
-    // 实际读取时：通过 block_list[i] -> 找到 block_index -> 找到物理数据
-    uint64_t block_list_start_index; 
+    uint32_t version_id;
+    time_t timestamp;
+    uint64_t file_size;
+    uint64_t block_list_start_index;
+    uint32_t block_count;
+    char commit_msg[64];
+    int is_pinned; // [新增] 1=锁定(不被自动清理), 0=普通
 } file_version_t;
 
 // ---------------------------------------------------------
@@ -62,10 +66,11 @@ typedef struct {
     uint32_t gid;                // 组ID
     uint32_t latest_version;     // 当前最新版本号
     uint32_t total_versions;     // 历史版本总数
-    
+    uint32_t link_count;
     // 版本链表/数组：指向该文件的所有历史版本
     // 这里简单化处理，实际可能需要单独的元数据区存储版本信息
     file_version_t versions[MAX_VERSIONS]; 
+    xattr_entry_t xattrs[4];
 } inode_t;
 // ---------------------------------------------------------
 // 5. 目录项 (Directory Entry)
