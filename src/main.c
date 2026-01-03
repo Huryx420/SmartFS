@@ -964,8 +964,155 @@ static void *smartfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) 
 
     return NULL;
 }
+static int smartfs_flush(const char *path, struct fuse_file_info *fi) {
+    (void) path; (void) fi;
+    // 因为我们的 smartfs_write 是同步写入到 L3 (storage_write) 的，
+    // 这里主要任务是确保 OS 把 disk_fd 的数据刷到物理磁盘。
+    printf("DEBUG: Flush %s\n", path);
+    if (disk_fd > 0) {
+        // 调用系统调用 fsync 确保镜像文件落盘
+        fsync(disk_fd); 
+    }
+    return 0;
+}
+static int smartfs_release(const char *path, struct fuse_file_info *fi) {
+    (void) path; (void) fi;
+    printf("DEBUG: Release %s\n", path);
+    // 如果你有打开的文件句柄表，这里应该释放资源
+    // 对于目前的无状态实现，直接返回成功即可
+    return 0;
+}
+static int smartfs_fsync(const char *path, int isdatasync, struct fuse_file_info *fi) {
+    (void) path; (void) isdatasync; (void) fi;
+    printf("DEBUG: Fsync %s\n", path);
+    if (disk_fd > 0) {
+        // 强制把 test.img 的所有脏页写入物理磁盘
+        return fsync(disk_fd);
+    }
+    return 0;
+}
+static int smartfs_setxattr(const char *path, const char *name, const char *value, size_t size, int flags) {
+    printf("DEBUG: setxattr path=%s name=%s value=%s\n", path, name, value);
 
+    if (size > 31) return -ERANGE; // 我们的 Demo 限制值最大 32 字节
 
+    uint64_t inode_id = resolve_path_to_inode(path);
+    if (inode_id == 0) return -ENOENT;
+
+    inode_t inode;
+    load_inode(inode_id, &inode);
+
+    // 1. 查找是否存在同名属性
+    int empty_slot = -1;
+    int found_idx = -1;
+
+    for (int i = 0; i < 4; i++) {
+        if (inode.xattrs[i].valid) {
+            if (strcmp(inode.xattrs[i].name, name) == 0) {
+                found_idx = i;
+            }
+        } else if (empty_slot == -1) {
+            empty_slot = i;
+        }
+    }
+
+    // 处理 flags (XATTR_CREATE, XATTR_REPLACE)
+    if (flags == 0x1 && found_idx != -1) return -EEXIST; // XATTR_CREATE (1) 但已存在
+    if (flags == 0x2 && found_idx == -1) return -ENODATA; // XATTR_REPLACE (2) 但不存在
+
+    // 确定写入位置
+    int target = (found_idx != -1) ? found_idx : empty_slot;
+    if (target == -1) return -ENOSPC; // 没有空位了
+
+    // 写入数据
+    strncpy(inode.xattrs[target].name, name, 31);
+    inode.xattrs[target].name[31] = '\0';
+    
+    strncpy(inode.xattrs[target].value, value, size);
+    inode.xattrs[target].value[size] = '\0'; // 确保 null结尾
+    
+    inode.xattrs[target].valid = 1;
+
+    save_inode(&inode);
+    return 0;
+}
+
+// 获取扩展属性 (getxattr)
+static int smartfs_getxattr(const char *path, const char *name, char *value, size_t size) {
+    printf("DEBUG: getxattr path=%s name=%s\n", path, name);
+
+    uint64_t inode_id = resolve_path_to_inode(path);
+    if (inode_id == 0) return -ENOENT;
+
+    inode_t inode;
+    load_inode(inode_id, &inode);
+
+    for (int i = 0; i < 4; i++) {
+        if (inode.xattrs[i].valid && strcmp(inode.xattrs[i].name, name) == 0) {
+            int val_len = strlen(inode.xattrs[i].value);
+            
+            if (size == 0) return val_len; // 用户查询 value 长度
+            if (size < val_len) return -ERANGE;
+
+            memcpy(value, inode.xattrs[i].value, val_len);
+            return val_len;
+        }
+    }
+    return -ENODATA; // 属性不存在
+}
+
+// 列出扩展属性 (listxattr)
+static int smartfs_listxattr(const char *path, char *list, size_t size) {
+    printf("DEBUG: listxattr path=%s\n", path);
+
+    uint64_t inode_id = resolve_path_to_inode(path);
+    if (inode_id == 0) return -ENOENT;
+
+    inode_t inode;
+    load_inode(inode_id, &inode);
+
+    // 计算总长度
+    size_t required_size = 0;
+    for (int i = 0; i < 4; i++) {
+        if (inode.xattrs[i].valid) {
+            required_size += strlen(inode.xattrs[i].name) + 1; // +1 是为了 \0
+        }
+    }
+
+    if (size == 0) return required_size;
+    if (size < required_size) return -ERANGE;
+
+    // 填充列表: name1\0name2\0
+    char *ptr = list;
+    for (int i = 0; i < 4; i++) {
+        if (inode.xattrs[i].valid) {
+            strcpy(ptr, inode.xattrs[i].name);
+            ptr += strlen(inode.xattrs[i].name) + 1;
+        }
+    }
+    return required_size;
+}
+
+// 删除扩展属性 (removexattr)
+static int smartfs_removexattr(const char *path, const char *name) {
+    printf("DEBUG: removexattr path=%s name=%s\n", path, name);
+
+    uint64_t inode_id = resolve_path_to_inode(path);
+    if (inode_id == 0) return -ENOENT;
+
+    inode_t inode;
+    load_inode(inode_id, &inode);
+
+    for (int i = 0; i < 4; i++) {
+        if (inode.xattrs[i].valid && strcmp(inode.xattrs[i].name, name) == 0) {
+            inode.xattrs[i].valid = 0; // 标记失效
+            memset(inode.xattrs[i].name, 0, 32);
+            save_inode(&inode);
+            return 0;
+        }
+    }
+    return -ENODATA;
+}
 static const struct fuse_operations smartfs_oper = {
     .init       = smartfs_init,
     .getattr  = smartfs_getattr,
@@ -984,6 +1131,13 @@ static const struct fuse_operations smartfs_oper = {
     .link       = smartfs_link,
     .symlink    = smartfs_symlink,
     .readlink   = smartfs_readlink,
+    .flush      = smartfs_flush,
+    .release    = smartfs_release,
+    .fsync      = smartfs_fsync,
+    .setxattr   = smartfs_setxattr,
+    .getxattr   = smartfs_getxattr,
+    .listxattr  = smartfs_listxattr,
+    .removexattr= smartfs_removexattr,
 };
 
 // =========================================================

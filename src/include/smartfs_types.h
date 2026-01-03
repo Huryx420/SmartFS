@@ -12,7 +12,12 @@
 #define MAX_FILENAME 255         // 最大文件名长度
 #define MAX_VERSIONS 128         // 每个文件最大保留版本数
 #define HASH_SIZE 32             // SHA-256 哈希值长度
-
+// 1. 定义扩展属性条目结构
+typedef struct {
+    char name[32];   // 属性名 (例如 "user.author")
+    char value[32];  // 属性值 (例如 "leishen")
+    int valid;       // 是否有效
+} xattr_entry_t;
 // ---------------------------------------------------------
 // 1. 超级块 (SuperBlock) - 整个文件系统的“身份证”
 // ---------------------------------------------------------
@@ -66,6 +71,7 @@ typedef struct {
     // 版本链表/数组：指向该文件的所有历史版本
     // 这里简单化处理，实际可能需要单独的元数据区存储版本信息
     file_version_t versions[MAX_VERSIONS]; 
+    xattr_entry_t xattrs[4];
 } inode_t;
 // ---------------------------------------------------------
 // 5. 目录项 (Directory Entry)
