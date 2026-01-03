@@ -352,103 +352,71 @@ static int smartfs_create(const char *path, mode_t mode, struct fuse_file_info *
 
 // 4. 写入文件 (write)
 // [修改] 集成快照与CoW的 write
+// =========================================================
+// 智能写入 (Smart Write Integration) - 模块A+B+C 集成版
+// =========================================================
 static int smartfs_write(const char *path, const char *buf, size_t size,
-                       off_t offset, struct fuse_file_info *fi) {
+                        off_t offset, struct fuse_file_info *fi) 
+{
     (void) fi;
-    
-    // 1. 检查是否试图写入历史版本 (不允许)
-    char real_path[MAX_FILENAME];
-    int version_req;
-    if (parse_version_path(path, real_path, &version_req) == 1) {
-        return -EROFS; // Read-only file system
-    }
+    printf("DEBUG: smartfs_write path=%s size=%lu offset=%ld\n", path, size, offset);
 
+    // 1. 找到文件的 Inode
     uint64_t inode_id = resolve_path_to_inode(path);
     if (inode_id == 0) return -ENOENT;
 
+    // 2. 调用模块 C 的智能写入接口
+    // 注意：smart_write 会自动处理去重、压缩、缓存和物理块分配
+    // 它返回的是实际写入的字节数
+    int written = smart_write((long)inode_id, (long)offset, buf, (int)size);
+    
+    if (written < 0) {
+        printf("ERROR: smart_write failed with code %d\n", written);
+        return -EIO;
+    }
+
+    // 3. 更新 Inode 元数据 (这是模块 A 的责任)
     inode_t inode;
     load_inode(inode_id, &inode);
 
-    // =========== [Mod B 集成点] ===========
-    // 2. 在写入前，创建快照 (保存当前状态为历史)
-    // 策略：每次写入都生成新版本 (为了演示效果)
-    version_mgr_create_snapshot(&inode, "Auto-save on write");
+    // 获取当前版本 (通常 smart_write 可能会更新最新版本的数据)
+    int v_idx = 0; // 简化逻辑：这里我们总是操作第 0 个版本作为“最新版”
+                   // 如果你的 smart_write 逻辑更加复杂（自动创建新版本），这里可能需要调整
     
-    // 3. 获取最新的版本 (这将是我们即将写入的版本)
-    file_version_t *v = version_mgr_get_version(&inode, 0);
-    // =====================================
-
-    // 4. [Copy-on-Write] 写时复制核心逻辑
-    // 为了不覆盖旧版本的数据块，我们必须为新版本分配一个新块
-    // (注意：这里简化处理，假设文件只有1个块。真实系统需要处理块列表)
-    
-    uint64_t old_block = v->block_list_start_index;
-    uint64_t new_block = allocate_block(); // 申请新物理块
-    if (new_block == 0) return -ENOSPC;
-
-    // 如果旧块有数据，先搬运过来 (继承数据)
-    if (old_block != 0) {
-        char temp_buf[BLOCK_SIZE];
-        lseek(disk_fd, old_block * BLOCK_SIZE, SEEK_SET);
-        read(disk_fd, temp_buf, BLOCK_SIZE);
-        
-        lseek(disk_fd, new_block * BLOCK_SIZE, SEEK_SET);
-        write(disk_fd, temp_buf, BLOCK_SIZE);
+    // 更新文件大小：如果这次写入超出了原来的范围
+    if (offset + written > inode.versions[v_idx].file_size) {
+        inode.versions[v_idx].file_size = offset + written;
     }
 
-    // 更新新版本指向新块
-    v->block_list_start_index = new_block;
-    v->block_count = 1;
+    // 更新修改时间
+    inode.versions[v_idx].timestamp = time(NULL);
 
-    // 5. 执行真正的写入 (写入新块)
-    off_t disk_offset = new_block * BLOCK_SIZE + offset;
-    lseek(disk_fd, disk_offset, SEEK_SET);
-    write(disk_fd, buf, size);
-
-    // 6. 更新文件大小
-    if (offset + size > v->file_size) {
-        v->file_size = offset + size;
-    }
-    
-    // 7. 保存 Inode (必须保存，否则版本信息丢失)
+    // 4. 保存 Inode
     save_inode(&inode);
 
-    return size;
+    printf("DEBUG: Write success. New size: %lu\n", inode.versions[v_idx].file_size);
+    return written;
 }
 
 // 5. 读取文件 (read)
 // [修改] 支持读取历史版本的 read
-static int smartfs_read(const char *path, char *buf, size_t size, off_t offset,
-                      struct fuse_file_info *fi) {
+// =========================================================
+// 智能读取 (Smart Read Integration) - 适配压缩与去重
+// =========================================================
+static int smartfs_read(const char *path, char *buf, size_t size, 
+                       off_t offset, struct fuse_file_info *fi) 
+{
     (void) fi;
+    printf("DEBUG: smartfs_read path=%s size=%lu offset=%ld\n", path, size, offset);
 
-    // 1. 解析路径和版本
-    char real_path[MAX_FILENAME];
-    int version_id = 0;
-    parse_version_path(path, real_path, &version_id);
-
-    uint64_t inode_id = resolve_path_to_inode(path); // 这里的 path 可以带 @，上面那个函数已经能处理了
+    uint64_t inode_id = resolve_path_to_inode(path);
     if (inode_id == 0) return -ENOENT;
 
-    // 2. 读取 Inode
-    inode_t inode;
-    load_inode(inode_id, &inode);
+    // 直接调用模块 C 的智能读取
+    // 它会自动查找物理块、解压数据、拼接内容
+    int bytes_read = smart_read((long)inode_id, (long)offset, buf, (int)size);
 
-    // 3. [关键] 获取指定版本的指针
-    file_version_t *v = version_mgr_get_version(&inode, version_id);
-    if (!v) return -ENOENT; // 版本不存在
-
-    // 4. 读取数据
-    if (offset >= v->file_size) return 0;
-    if (offset + size > v->file_size) size = v->file_size - offset;
-
-    if (v->block_count > 0) {
-        uint64_t phys_block = v->block_list_start_index;
-        lseek(disk_fd, phys_block * BLOCK_SIZE + offset, SEEK_SET);
-        read(disk_fd, buf, size);
-    }
-
-    return size;
+    return bytes_read;
 }
 
 // 6. 删除文件 (unlink)
@@ -796,6 +764,12 @@ static int smartfs_statfs(const char *path, struct statvfs *stbuf) {
     stbuf->f_bfree = sb.free_blocks;
     stbuf->f_bavail = sb.free_blocks;
     stbuf->f_namemax = MAX_FILENAME;
+    // ==========================================
+    // 🔴 新增：每次运行 df 命令时，打印监控报表
+    // ==========================================
+    printf("\n[Monitor] Triggering Storage Report...\n");
+    print_storage_report(); // 调用模块 C 的报表函数
+    // ==========================================
     return 0;
 }
 
@@ -844,10 +818,32 @@ int load_superblock() {
     return 0;
 }
 
-int main(int argc, char *argv[])
-{
-    if (load_superblock() != 0) {
+// src/main.c 的最底部
+
+int main(int argc, char *argv[]) {
+    // 1. 解析参数 (这部分可能你原来就有)
+    int fuse_stat;
+    struct smartfs_state *smartfs_data;
+    
+    // ... 这里可能有你之前的参数解析代码 ...
+
+    // 2. 打开磁盘镜像文件
+    disk_fd = open("test.img", O_RDWR);
+    if (disk_fd < 0) {
+        perror("Cannot open test.img");
         return 1;
     }
-    return fuse_main(argc, argv, &smartfs_oper, NULL);
+
+    // ==========================================
+    // 🔴 必须添加：初始化模块 C (存储引擎)
+    // ==========================================
+    printf("[Init] Initializing LRU Cache (Capacity: 100 blocks)...\n");
+    lru_init(100);  // <--- 加上这一行！分配100个块的缓存空间
+    // ==========================================
+
+    // 3. 启动 FUSE
+    printf("[Init] Starting SmartFS...\n");
+    fuse_stat = fuse_main(argc, argv, &smartfs_oper, smartfs_data);
+
+    return fuse_stat;
 }
