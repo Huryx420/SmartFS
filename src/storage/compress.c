@@ -4,71 +4,61 @@
 #include <stdlib.h>
 #include <string.h>
 
-// 定义一个缓冲区大小 (4KB)
 #define BLOCK_SIZE 4096
 
-// 核心功能：压缩数据
-// input: 原始数据
-// input_len: 原始长度
-// output: 压缩后的数据存放位置 (需要预先分配好内存)
-// 返回值: 压缩后的大小 (字节数)。如果返回 0 或负数说明出错。
+// 获取系统负载
+double get_system_load() {
+    double load[1];
+    if (getloadavg(load, 1) != -1) return load[0];
+    return 0.0;
+}
+
+// 智能跳过检测
+int is_already_compressed(const char *data, int len) {
+    if (len < 4) return 0; 
+    unsigned char *bytes = (unsigned char *)data;
+    if (bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) return 1;
+    if (bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E && bytes[3] == 0x47) return 1;
+    if (bytes[0] == 0x50 && bytes[1] == 0x4B && bytes[2] == 0x03 && bytes[3] == 0x04) return 1;
+    if (bytes[0] == 0x1F && bytes[1] == 0x8B) return 1;
+    return 0; 
+}
+
+// 智能压缩
 int smart_compress(const char *input, int input_len, char *output) {
-    // LZ4_compress_default 是库函数，专门干这个的
-    // 参数含义: 源数据, 目标buffer, 源长度, 目标buffer最大容量
-    int compressed_size = LZ4_compress_default(input, output, input_len, BLOCK_SIZE);
-    
-    if (compressed_size <= 0) {
-        printf("压缩失败！可能数据太大了或者不可压缩。\n");
-        return -1;
-    }
-    return compressed_size;
-}
-
-// 核心功能：解压数据 (读文件时要用)
-int smart_decompress(const char *input, int input_len, char *output, int max_output_len) {
-    int decompressed_size = LZ4_decompress_safe(input, output, input_len, max_output_len);
-    if (decompressed_size < 0) {
-        printf("解压失败！数据可能损坏。\n");
-        return -1;
-    }
-    return decompressed_size;
-}
-/*
-// 测试函数 (Main)
-int main() {
-    // 1. 准备一段数据
-    // 重复的内容越多，压缩效果越好。如果是随机乱码，可能压不动。
-    const char *original = "SmartFS is fast! SmartFS is fast! SmartFS is fast! SmartFS is fast! SmartFS is fast!";
-    int original_len = strlen(original);
-    
-    // 2. 准备缓冲区
-    char compressed_buffer[BLOCK_SIZE];
-    char decompressed_buffer[BLOCK_SIZE];
-
-    printf("=== LZ4 压缩测试 ===\n");
-    printf("原始数据: %s\n", original);
-    printf("原始大小: %d 字节\n", original_len);
-
-    // 3. 尝试压缩
-    int c_size = smart_compress(original, original_len, compressed_buffer);
-    if (c_size > 0) {
-        printf("压缩后大小: %d 字节 (节省了 %d%% 空间)\n", 
-               c_size, (original_len - c_size) * 100 / original_len);
+    if (is_already_compressed(input, input_len)) {
+        printf("[Compress] ⏩ Smart Skip: Detected compressed data, skipping.\n");
+        memcpy(output, input, input_len);
+        return input_len; 
     }
 
-    // 4. 尝试解压
-    int d_size = smart_decompress(compressed_buffer, c_size, decompressed_buffer, BLOCK_SIZE);
-    if (d_size > 0) {
-        decompressed_buffer[d_size] = '\0'; // 补上字符串结尾
-        printf("解压后验证: %s\n", decompressed_buffer);
-    }
+    double load = get_system_load();
+    int c_size;
 
-    // 5. 简单的校验
-    if (strcmp(original, decompressed_buffer) == 0) {
-        printf(">>> 测试通过：数据完美还原！ <<<\n");
+    if (load > 2.0) {
+        printf("[Compress] 🔥 High Load (%.2f)! Switching to FAST mode.\n", load);
+        c_size = LZ4_compress_fast(input, output, input_len, BLOCK_SIZE, 5);
     } else {
-        printf(">>> 测试失败：数据不一致！ <<<\n");
+        c_size = LZ4_compress_default(input, output, input_len, BLOCK_SIZE);
     }
 
-    return 0;
-}*/
+    if (c_size <= 0 || c_size >= input_len) {
+        printf("[Compress] ⚠️ Compression inefficient (Load: %.2f), storing raw data.\n", load);
+        memcpy(output, input, input_len);
+        return input_len;
+    }
+
+    printf("[Compress] ✅ Compressed (Load: %.2f): %d -> %d bytes\n", load, input_len, c_size);
+    return c_size;
+}
+
+// 智能解压
+int smart_decompress(const char *input, int input_len, char *output, int max_output_len) {
+    int d_size = LZ4_decompress_safe(input, output, input_len, max_output_len);
+    if (d_size < 0) {
+        // 如果解压失败，可能原本就没压缩（Smart Skip 的数据），直接拷贝
+        memcpy(output, input, input_len);
+        return input_len;
+    }
+    return d_size;
+}
