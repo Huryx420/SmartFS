@@ -243,6 +243,7 @@ static int smartfs_getattr(const char *path, struct stat *stbuf, struct fuse_fil
 
     uint64_t inode_id = resolve_path_to_inode(path);
     if (inode_id == 0) return -ENOENT;
+    printf("DEBUG: getattr path=%s -> resolved_inode=%lu\n", path, inode_id);
 
     inode_t inode;
     load_inode(inode_id, &inode);
@@ -266,6 +267,7 @@ static int smartfs_getattr(const char *path, struct stat *stbuf, struct fuse_fil
     if (target_idx == -1) return -ENOENT; // 找不到该版本
 
     // 3. 填充属性
+    stbuf->st_ino = inode_id;
     stbuf->st_mode = inode.mode;
     stbuf->st_nlink = inode.link_count;
     
@@ -363,6 +365,7 @@ static int smartfs_create(const char *path, mode_t mode, struct fuse_file_info *
     new_inode.mode = mode | S_IFREG; 
     new_inode.uid = getuid();
     new_inode.gid = getgid();
+    new_inode.total_versions = 1;
     new_inode.latest_version = 1;
     new_inode.versions[0].version_id = 1;
     new_inode.versions[0].timestamp = time(NULL);
@@ -394,8 +397,18 @@ static int smartfs_write(const char *path, const char *buf, size_t size,
     inode_t inode;
     load_inode(inode_id, &inode);
 
-    // 2. 创建快照 (CoW)
-    version_mgr_create_snapshot(&inode, "Auto-save on write");
+ int current_idx = inode.total_versions - 1;
+    if (current_idx < 0) current_idx = 0;
+
+    // 🔴 [修改点] 只有当当前版本有数据 (size > 0) 时才快照
+    // 如果 size == 0，说明刚刚发生了 truncate，或者这是一个新文件。
+    // 这时候不需要保存一个“空版本”，直接在当前版本写入即可。
+    if (inode.versions[current_idx].file_size > 0) {
+        printf("DEBUG: Snapshot triggered by write (size > 0)\n");
+        version_mgr_create_snapshot(&inode, "Auto-save on write");
+    } else {
+        printf("DEBUG: Write on empty file -> Skipping snapshot to avoid duplicates.\n");
+    }
 
     // ---------------------------------------------------------
     // 步骤 A: 准备缓冲区 (Read-Modify-Write)
@@ -410,11 +423,10 @@ static int smartfs_write(const char *path, const char *buf, size_t size,
     int old_size = inode.versions[latest_idx].file_size;
 
     // 如果旧文件有内容，先读出来！(这是追加写入的关键)
-    if (old_block_id > 0 && old_size > 0) {
-        // 调用 smart_read 从底层读取旧数据到 merge_buffer
-        // 注意：这里我们读取整个块，简化起见假设文件小于 4KB
-        smart_read(old_block_id, merge_buffer, BLOCK_SIZE);
-    }
+if (old_block_id > 0 && old_size > 0) {
+    // ✅ 修正：补上 inode_id，并将 old_block_id 作为第二个参数(offset)传入
+    smart_read((long)inode_id, (long)old_block_id, merge_buffer, BLOCK_SIZE);
+}
 
     // ---------------------------------------------------------
     // 步骤 B: 合并数据
@@ -517,7 +529,8 @@ static int smartfs_read(const char *path, char *buf, size_t size,
     char temp_block[BLOCK_SIZE]; // 在栈上申请 4KB 临时空间
     
     // 1. 把整个块解压到临时 buffer
-    int bytes_in_block = smart_read(physical_block_id, temp_block, BLOCK_SIZE);
+   // ✅ 修正：补上 inode_id，并将 physical_block_id 作为第二个参数(offset)传入
+int bytes_in_block = smart_read((long)inode_id, (long)physical_block_id, temp_block, BLOCK_SIZE);
     
     if (bytes_in_block <= 0) return 0;
 
@@ -628,6 +641,16 @@ static int smartfs_truncate(const char *path, off_t size, struct fuse_file_info 
     // 必须同步更新 latest_version 指针和 ID，否则读取时会错乱 (和 write 修复逻辑一致)
     inode.latest_version = inode.total_versions; 
     inode.versions[new_latest_idx].version_id = inode.latest_version;
+   if (size == 0) {
+        // 1. 告诉系统这个版本现在有 0 个块
+        inode.versions[new_latest_idx].block_count = 0;
+        
+        // 2. 将块列表索引指向无效值 (通常 0 或 -1，视你的实现而定，这里设为 0 安全)
+        // 这样 smartfs_write 里的 get_block_id 就找不到旧块了
+        inode.versions[new_latest_idx].block_list_start_index = 0;
+        
+        printf("DEBUG: Truncate to 0 -> Reset block_count to 0.\n");
+   }
 
     save_inode(&inode);
     return 0;
@@ -674,6 +697,7 @@ static int smartfs_mkdir(const char *path, mode_t mode) {
     new_inode.mode = S_IFDIR | mode;
     new_inode.uid = getuid();
     new_inode.gid = getgid();
+    new_inode.total_versions = 1;
     new_inode.latest_version = 1;
 
     uint64_t new_block = allocate_block();
@@ -902,8 +926,12 @@ static int smartfs_readlink(const char *path, char *buf, size_t size) {
     return 0;
 }
 static int smartfs_open(const char *path, struct fuse_file_info *fi) {
-    (void) path; // <--- 新增：告诉编译器忽略 path
-    (void) fi;   // <--- 新增：告诉编译器忽略 fi
+ // 如果用户使用了 "w" 模式 (echo > file)，会带上 O_TRUNC
+    if ((fi->flags & O_TRUNC) && (fi->flags & (O_WRONLY | O_RDWR))) {
+        printf("DEBUG: Open with O_TRUNC detected for %s -> Truncating to 0\n", path);
+        // 手动调用你的截断函数
+        return smartfs_truncate(path, 0, fi);
+    }
     return 0;
 }
 
@@ -922,8 +950,24 @@ static int smartfs_statfs(const char *path, struct statvfs *stbuf) {
     // ==========================================
     return 0;
 }
+// 1. 定义 init 函数
+static void *smartfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
+    (void) conn;
+    
+    // 🔴 关键：在这里开启 use_ino
+    cfg->use_ino = 1; 
+    
+    // 如果你想让内核缓存属性（提高 ls 速度），可以开启这个，但在调试阶段建议关掉
+    // cfg->entry_timeout = 0;
+    // cfg->attr_timeout = 0;
+    // cfg->negative_timeout = 0;
+
+    return NULL;
+}
+
 
 static const struct fuse_operations smartfs_oper = {
+    .init       = smartfs_init,
     .getattr  = smartfs_getattr,
     .statfs   = smartfs_statfs,
     .readdir  = smartfs_readdir,

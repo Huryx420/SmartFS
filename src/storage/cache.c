@@ -1,125 +1,156 @@
+#include "storage.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "storage.h"
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
-// 定义缓存容量
-#define CACHE_CAPACITY 5
+#define BLOCK_SIZE 4096
 
-// 定义缓存节点 (双向链表)
+// === L1 Cache (内存链表) ===
 typedef struct CacheNode {
-    int block_id;             // 键：块ID
-    char *data;               // 值：实际数据内容
-    int data_len;             // 数据长度
-    struct CacheNode *prev;   // 前一个节点
-    struct CacheNode *next;   // 后一个节点
+    int block_id;
+    char *data;
+    struct CacheNode *prev, *next;
 } CacheNode;
 
-// 定义缓存管理器
 typedef struct {
-    int size;                 // 当前存了多少个
-    int capacity;             // 最大能存多少
-    CacheNode *head;          // 链表头 (最近使用的)
-    CacheNode *tail;          // 链表尾 (最久没用的)
+    int capacity;
+    int size;
+    CacheNode *head, *tail;
 } LRUCache;
 
-// 全局唯一的缓存实例
-LRUCache *global_cache = NULL;
+static LRUCache *l1_cache = NULL;
 
-// 初始化缓存
+// === L2 Cache (MMap 文件) ===
+#define L2_CAPACITY 100
+#define L2_FILENAME "smartfs_l2.cache"
+
+typedef struct {
+    int valid;
+    int block_id;
+    char data[BLOCK_SIZE];
+} L2CacheEntry;
+
+static L2CacheEntry *l2_mmap_ptr = NULL;
+static int l2_fd = -1;
+
+void init_l2_cache() {
+    l2_fd = open(L2_FILENAME, O_RDWR | O_CREAT, 0666);
+    if (l2_fd < 0) return;
+    size_t file_size = L2_CAPACITY * sizeof(L2CacheEntry);
+    ftruncate(l2_fd, file_size);
+    l2_mmap_ptr = (L2CacheEntry *)mmap(NULL, file_size, PROT_READ | PROT_WRITE, MAP_SHARED, l2_fd, 0);
+}
+
+// L2 写入
+void l2_put(int block_id, const char *data) {
+    if (!l2_mmap_ptr) return;
+    int index = block_id % L2_CAPACITY;
+    l2_mmap_ptr[index].valid = 1;
+    l2_mmap_ptr[index].block_id = block_id;
+    memcpy(l2_mmap_ptr[index].data, data, BLOCK_SIZE);
+    msync(&l2_mmap_ptr[index], sizeof(L2CacheEntry), MS_SYNC);
+    printf("[L2] ↘️ Evicted to L2: Block #%d (Slot %d)\n", block_id, index);
+}
+
+// L2 读取
+char* l2_get(int block_id) {
+    if (!l2_mmap_ptr) return NULL;
+    int index = block_id % L2_CAPACITY;
+    if (l2_mmap_ptr[index].valid && l2_mmap_ptr[index].block_id == block_id) {
+        printf("[L2] 🚀 L2 Cache Hit: Block #%d\n", block_id);
+        return l2_mmap_ptr[index].data;
+    }
+    return NULL;
+}
+
+// === L1 操作实现 ===
+
 void lru_init(int capacity) {
-    global_cache = (LRUCache *)malloc(sizeof(LRUCache));
-    global_cache->size = 0;
-    global_cache->capacity = capacity;
-    global_cache->head = NULL;
-    global_cache->tail = NULL;
-    printf("[LRU] 缓存系统初始化完毕，容量: %d\n", capacity);
+    l1_cache = (LRUCache *)malloc(sizeof(LRUCache));
+    l1_cache->capacity = capacity;
+    l1_cache->size = 0;
+    l1_cache->head = l1_cache->tail = NULL;
+    init_l2_cache();
+    printf("[Cache] 🧠 L1 Initialized (%d blocks) + L2 MMap Linked.\n", capacity);
 }
 
-// 内部函数：把节点移动到头部 (表示刚刚用过)
-void _move_to_head(CacheNode *node) {
-    if (node == global_cache->head) return; // 已经在头了
-
-    // 1. 把自己在原来的位置断开
+void lru_remove_node(CacheNode *node) {
     if (node->prev) node->prev->next = node->next;
+    else l1_cache->head = node->next;
     if (node->next) node->next->prev = node->prev;
-    
-    // 如果它是尾巴，更新尾巴
-    if (node == global_cache->tail) global_cache->tail = node->prev;
-
-    // 2. 插到头部
-    node->next = global_cache->head;
-    node->prev = NULL;
-    
-    if (global_cache->head) global_cache->head->prev = node;
-    global_cache->head = node;
+    else l1_cache->tail = node->prev;
 }
 
-// 核心功能：存入缓存 (Put)
-void lru_put(int block_id, const char *data, int len) {
-    // 1. 先检查是不是已经存在了 (简化版：遍历查找)
-    CacheNode *cur = global_cache->head;
-    while (cur) {
-        if (cur->block_id == block_id) {
-            // 找到了！更新数据并移到头部
-            printf("[LRU] 更新热点数据: Block #%d\n", block_id);
-            free(cur->data); // 释放旧数据
-            cur->data = (char*)malloc(len);
-            memcpy(cur->data, data, len);
-            cur->data_len = len;
-            _move_to_head(cur);
+void lru_add_to_head(CacheNode *node) {
+    node->next = l1_cache->head;
+    node->prev = NULL;
+    if (l1_cache->head) l1_cache->head->prev = node;
+    l1_cache->head = node;
+    if (!l1_cache->tail) l1_cache->tail = node;
+}
+
+// 【关键修正】这里现在严格匹配 storage.h，只有 2 个参数！
+void lru_put(int block_id, const char *data) {
+    if (!l1_cache) return;
+
+    // 1. 查重更新
+    CacheNode *curr = l1_cache->head;
+    while (curr) {
+        if (curr->block_id == block_id) {
+            memcpy(curr->data, data, BLOCK_SIZE);
+            lru_remove_node(curr);
+            lru_add_to_head(curr);
             return;
         }
-        cur = cur->next;
+        curr = curr->next;
     }
 
-    // 2. 如果是新数据
-    printf("[LRU] 存入新缓存: Block #%d\n", block_id);
-    
-    // 检查是不是满了
-    if (global_cache->size >= global_cache->capacity) {
-        // 满了！淘汰尾部 (最久没用的)
-        CacheNode *victim = global_cache->tail;
-        printf("[LRU] 🔥 缓存已满，淘汰 Block #%d\n", victim->block_id);
+    // 2. 淘汰逻辑 (L1 -> L2)
+    if (l1_cache->size >= l1_cache->capacity) {
+        CacheNode *tail = l1_cache->tail;
+        // 把被淘汰的数据写入 L2
+        l2_put(tail->block_id, tail->data); 
         
-        // 从链表移除
-        if (victim->prev) victim->prev->next = NULL;
-        global_cache->tail = victim->prev;
-        
-        // 释放内存
-        free(victim->data);
-        free(victim);
-        global_cache->size--;
+        lru_remove_node(tail);
+        free(tail->data);
+        free(tail);
+        l1_cache->size--;
     }
 
-    // 3. 创建新节点插到头部
+    // 3. 新增
     CacheNode *new_node = (CacheNode *)malloc(sizeof(CacheNode));
     new_node->block_id = block_id;
-    new_node->data = (char*)malloc(len);
-    memcpy(new_node->data, data, len);
-    new_node->data_len = len;
-    new_node->prev = NULL;
-    new_node->next = global_cache->head;
-
-    if (global_cache->head) global_cache->head->prev = new_node;
-    global_cache->head = new_node;
+    new_node->data = (char *)malloc(BLOCK_SIZE);
+    memcpy(new_node->data, data, BLOCK_SIZE);
     
-    if (global_cache->size == 0) global_cache->tail = new_node;
-    global_cache->size++;
+    lru_add_to_head(new_node);
+    l1_cache->size++;
+    printf("[L1] 📥 Added to L1: Block #%d\n", block_id);
 }
 
-// 核心功能：读取缓存 (Get)
-// 返回：数据指针 (如果在缓存里) 或 NULL (如果不在)
 char* lru_get(int block_id) {
-    CacheNode *cur = global_cache->head;
-    while (cur) {
-        if (cur->block_id == block_id) {
-            printf("[LRU] ✅ 命中缓存: Block #%d\n", block_id);
-            _move_to_head(cur); // 关键：读了一次，它就变成最新的了
-            return cur->data;
+    if (!l1_cache) return NULL;
+    CacheNode *curr = l1_cache->head;
+    while (curr) {
+        if (curr->block_id == block_id) {
+            printf("[L1] ✅ L1 Hit: Block #%d\n", block_id);
+            lru_remove_node(curr);
+            lru_add_to_head(curr);
+            return curr->data;
         }
-        cur = cur->next;
+        curr = curr->next;
     }
-    printf("[LRU] ❌ 未命中: Block #%d\n", block_id);
+    
+    // 查 L2
+    char *l2_data = l2_get(block_id);
+    if (l2_data) {
+        // 如果 L2 找到了，把它“升级”回 L1
+        lru_put(block_id, l2_data); 
+        // 再次获取（这次一定在 L1 里了）
+        return lru_get(block_id);
+    }
     return NULL;
 }

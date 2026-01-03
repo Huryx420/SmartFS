@@ -28,6 +28,7 @@ add_executable(smartfs
     src/main.c
     src/versioning/version_mgr.c
     src/versioning/version_utils.c
+    src/storage/l3_storage.c
     src/storage/cache.c
     src/storage/compress.c
     src/storage/dedup.c
