@@ -67,8 +67,6 @@ typedef struct {
     // 这里简单化处理，实际可能需要单独的元数据区存储版本信息
     file_version_t versions[MAX_VERSIONS]; 
 } inode_t;
-
-#endif
 // ---------------------------------------------------------
 // 5. 目录项 (Directory Entry)
 // ---------------------------------------------------------
@@ -78,3 +76,4 @@ typedef struct {
     uint64_t inode_no;           // 对应的 Inode 编号
     uint8_t  is_valid;           // 1=有效，0=已删除
 } smartfs_dir_entry_t;
+#endif
