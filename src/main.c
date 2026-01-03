@@ -381,7 +381,7 @@ static int smartfs_create(const char *path, mode_t mode, struct fuse_file_info *
 // 智能写入 (Smart Write Integration) - 模块A+B+C 集成版
 // =========================================================
 static int smartfs_write(const char *path, const char *buf, size_t size,
-                        off_t offset, struct fuse_file_info *fi) 
+                         off_t offset, struct fuse_file_info *fi) 
 {
     (void) fi;
     printf("DEBUG: smartfs_write path=%s size=%lu offset=%ld\n", path, size, offset);
@@ -390,56 +390,83 @@ static int smartfs_write(const char *path, const char *buf, size_t size,
     uint64_t inode_id = resolve_path_to_inode(path);
     if (inode_id == 0) return -ENOENT;
 
-    // [修改点 A] 提前加载 Inode！
-    // 必须在写入前加载，否则我们无法保留"旧状态"
+    // 加载 Inode
     inode_t inode;
     load_inode(inode_id, &inode);
 
-    // [修改点 B] 核心：创建快照 (Module B)
-    // 这行代码会将当前的 v0 (最新版) 复制一份保存为 v1 (历史版)
-    // 这样，接下来的写入只会修改 v0，而 v1 依然指向旧的数据块
+    // 2. 创建快照 (CoW)
     version_mgr_create_snapshot(&inode, "Auto-save on write");
 
-    // [关键修改] 定义一个变量接收 Block ID
+    // ---------------------------------------------------------
+    // 步骤 A: 准备缓冲区 (Read-Modify-Write)
+    // ---------------------------------------------------------
+    // 我们需要一个完整的块大小缓冲区，用来合并旧数据和新数据
+    char merge_buffer[BLOCK_SIZE];
+    memset(merge_buffer, 0, BLOCK_SIZE);
+
+    // 获取当前最新版本 (v0) 的旧数据块 ID
+    int latest_idx = inode.total_versions - 1;
+    int old_block_id = inode.versions[latest_idx].block_list_start_index;
+    int old_size = inode.versions[latest_idx].file_size;
+
+    // 如果旧文件有内容，先读出来！(这是追加写入的关键)
+    if (old_block_id > 0 && old_size > 0) {
+        // 调用 smart_read 从底层读取旧数据到 merge_buffer
+        // 注意：这里我们读取整个块，简化起见假设文件小于 4KB
+        smart_read(old_block_id, merge_buffer, BLOCK_SIZE);
+    }
+
+    // ---------------------------------------------------------
+    // 步骤 B: 合并数据
+    // ---------------------------------------------------------
+    // 检查是否越界 (简化版：仅支持单块 4KB)
+    if (offset + size > BLOCK_SIZE) {
+        return -EFBIG; // 文件太大，超过 demo 限制
+    }
+
+    // 将用户的新数据 memcpy 到 merge_buffer 的指定偏移位置
+    // 这实现了覆盖或追加：
+    // - 覆盖：offset=0, memcpy 覆盖开头
+    // - 追加：offset=old_size, memcpy 接在后面
+    memcpy(merge_buffer + offset, buf, size);
+
+    // 计算新的文件总大小
+    int new_total_size = offset + size;
+    if (new_total_size < old_size) new_total_size = old_size; // 如果是中间修改，大小可能不变
+
+    // ---------------------------------------------------------
+    // 步骤 C: 写入新块
+    // ---------------------------------------------------------
     int physical_block_id = 0;
 
-    // 2. 调用 Module C 智能写入
-    // 它负责去重、压缩、落盘，并告诉我们数据存到了哪个物理块 (physical_block_id)
-    int written = smart_write((long)inode_id, (long)offset, buf, (int)size, &physical_block_id);
+    // 调用 Module C，写入合并后的完整块
+    // 注意：这里传入的是 merge_buffer，大小是 new_total_size (或者 BLOCK_SIZE，取决于你的存储层设计)
+    // 为了更精确的去重，我们传入实际有效数据长度
+    int written = smart_write((long)inode_id, 0, merge_buffer, new_total_size, &physical_block_id);
     
     if (written < 0) {
         return -EIO;
     }
 
-    // 3. 更新 Inode 的最新版本 (v0)
-    // 注意：这里我们只更新 v0，刚才的 v1 已经安全地指向旧块了
-    int v_idx = inode.total_versions - 1;
-
+    // ---------------------------------------------------------
+    // 步骤 D: 更新元数据
+    // ---------------------------------------------------------
     // 将返回的 Block ID 存入 v0
     if (physical_block_id > 0) {
-        inode.versions[v_idx].block_list_start_index = physical_block_id;
-        inode.versions[v_idx].block_count = 1; 
+        inode.versions[latest_idx].block_list_start_index = physical_block_id;
+        inode.versions[latest_idx].block_count = 1; 
     }
 
     // 更新文件大小和时间
-    if (offset + written > inode.versions[v_idx].file_size) {
-        inode.versions[v_idx].file_size = offset + written;
-    }
-    inode.versions[v_idx].timestamp = time(NULL);
+    inode.versions[latest_idx].file_size = new_total_size;
+    inode.versions[latest_idx].timestamp = time(NULL);
 
-    // 4. 保存 Inode
-    // 此时 Inode 里既有更新后的 v0，也有备份好的 v1
+    // 保存 Inode
     save_inode(&inode);
 
-    return written;
+    // 告诉 FUSE 我们成功写入了用户请求的 size 字节
+    return size;
 }
-
-// 5. 读取文件 (read)
-// [修改] 支持读取历史版本的 read
-// =========================================================
-// 智能读取 (Smart Read Integration) - 适配压缩与去重
-// =========================================================
-// [修改] 修复后的 smartfs_read (完美融合 Mod B 和 Mod C)
 static int smartfs_read(const char *path, char *buf, size_t size, 
                        off_t offset, struct fuse_file_info *fi) 
 {
