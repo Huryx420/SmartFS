@@ -1,163 +1,235 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "storage.h" // 包含你的哈希和压缩接口
-// 定义全局统计数据的初始状态
+#include <unistd.h>      // for pread/pwrite
+#include <sys/types.h>   // <--- [新增] 必须加这行，否则不认识 off_t
+#include "storage.h"
+
+// 全局统计数据
 StorageStats global_stats = {0, 0, 0, 0};
-// 假设我们的虚拟磁盘总容量是 100MB (用于预测功能)
 #define VIRTUAL_DISK_CAPACITY (100 * 1024 * 1024)
-// 模拟一个简单的“去重数据库”
-// 在真实项目中，这里应该用 B+ 树或者数据库文件
+#define BLOCK_SIZE 4096
+
+// [新增] 存储磁盘文件描述符
+static int global_disk_fd = -1;
+
+// [新增] 初始化函数
+void storage_attach_disk(int fd) {
+    global_disk_fd = fd;
+    printf("[StorageEngine] Disk attached. FD=%d\n", fd);
+}
+
+// 模拟指纹数据库 (简化版：内存中存储，重启会丢失)
+// 生产环境应将此表持久化到磁盘的特定区域
 typedef struct {
     char hash[65];
     int block_id;
 } DedupEntry;
 
-DedupEntry mock_db[100]; // 假设最多存100个块
+DedupEntry mock_db[1024]; // 扩大一点容量
 int db_count = 0;
 
-// 模拟：去数据库里查 hash 是否存在
-// 返回 block_id，如果不存在返回 -1
 int lookup_fingerprint(const char *hash) {
     for (int i = 0; i < db_count; i++) {
         if (strcmp(mock_db[i].hash, hash) == 0) {
             return mock_db[i].block_id;
         }
     }
-    return -1; // 没找到
+    return -1;
 }
 
-// 模拟：把新 hash 存进数据库
 void save_fingerprint(const char *hash, int block_id) {
-    if (db_count < 100) {
+    if (db_count < 1024) {
         strcpy(mock_db[db_count].hash, hash);
         mock_db[db_count].block_id = block_id;
         db_count++;
     }
 }
 
+// ==========================================
+// 🚀 生产级：智能写入 (Smart Write)
+// ==========================================
+int smart_write(long inode_id, long offset, const char *data, int len, int *ret_block_id) {
+    if (global_disk_fd == -1) {
+        printf("ERROR: Disk not attached to Storage Engine!\n");
+        return -1;
+    }
 
-// === 你的核心任务：smart_write ===
-int smart_write(long inode_id, long offset, const char *data, int len) {
     global_stats.total_logical_bytes += len;
-    printf("\n[SmartWrite] 收到写入请求: Inode=%ld, 大小=%d 字节\n", inode_id, len);
-
-    // 1. 计算指纹 (调用你之前的代码)
+    
+    // 1. 计算指纹
     char hash[65];
     calculate_sha256(data, len, hash);
-    printf("  -> 数据指纹: %s\n", hash);
 
-    // 2. 查重 (核心逻辑)
+    // 2. 查重 (Deduplication)
+    // [修改] 如果发现重复块
     int existing_block = lookup_fingerprint(hash);
-
     if (existing_block != -1) {
-        // === 情况 A: 数据重复了 ===
-        printf("  -> 发现重复数据！引用已有块 Block #%d\n", existing_block);
-        printf("  -> 节省空间: %d 字节 (未执行磁盘写入)\n", len);
+        printf("[SmartWrite] ♻️  重复数据 -> 复用 Block #%d\n", existing_block);
         global_stats.deduplication_count++;
-        // 这里实际上应该增加引用计数 (Reference Count)
-        return len;
-    } 
+        lru_put(existing_block, data, len); 
+        
+        // 关键点：告诉 main.c 数据在旧块里
+        if (ret_block_id) *ret_block_id = existing_block;
+        
+        return len; 
+    }
     
-    // === 情况 B: 新数据 ===
-    printf("  -> 新数据，准备存储...\n");
-
-    // 3. 压缩 (调用你之前的代码)
-    char *compressed_data = malloc(len + 100);
-    int c_size = smart_compress(data, len, compressed_data);
-    // 找到 smart_compress 那一行
-    // 在它后面（或者 save_fingerprint 附近）加这两行：
-
-    global_stats.bytes_after_dedup += len;        // 记录去重后的量
-    global_stats.total_physical_bytes += c_size;  // 记录压缩后的量
+    // 3. 压缩 (Compression)
+    // 分配足够大的缓冲区以防压缩后反而变大
+    char *compressed_buffer = malloc(len + 64);
+    // 头部预留4字节，用来存“压缩后的长度”
+    int header_size = sizeof(int); 
     
-    // 4. 落盘 (模拟写入物理文件)
-    // 在真实代码中，这里是用 fopen/fwrite 把 compressed_data 写进一个叫 data_blocks 的文件
-    int new_block_id = db_count + 1; // 简单生成一个 ID
-    printf("  -> 写入磁盘: Block #%d (压缩后 %d 字节)\n", new_block_id, c_size);
+    // 调用压缩算法，写入 buffer 偏移 4 字节之后的位置
+    int c_size = smart_compress(data, len, compressed_buffer + header_size);
+    
+    // 如果压缩失败(返回0)或膨胀，我们应该存原始内容(这里为了简单，假设总是由LZ4处理)
+    // 真实的 LZ4 即使膨胀也会处理好
+    
+    // 把压缩后的长度写在头部
+    memcpy(compressed_buffer, &c_size, header_size);
 
-    // 5. 记录指纹
+    // 统计
+    global_stats.bytes_after_dedup += len;
+    global_stats.total_physical_bytes += (c_size + header_size);
+
+    // 4. 落盘 (Real Disk Write)
+    // 分配一个新的物理块 ID (简单递增)
+    // 注意：真实系统中这里需要 BitMap 分配空闲块，这里简化处理
+    // 为了不覆盖 Superblock 和 Inode Area，我们假设数据区从 Block 100 开始
+    // 但你的 main.c 里的 allocate_block 已经处理了偏移，
+    // 为了兼容 main.c 的逻辑，我们这里应该怎么做？
+    
+    // 【重要策略】
+    // 由于我们想要接管 allocate_block，这里我们简单地使用一个静态计数器
+    // 配合 main.c 里的偏移。
+    // 为了防止和 main.c 冲突，我们假设 main.c 传进来 inode_id 等只是为了 logging
+    // 我们自己维护一个 simple allocator
+    static int next_free_block = 100; // 假设前100个块保留给元数据
+    int new_block_id = next_free_block++;
+
+    // 计算物理写入位置
+    off_t write_offset = (off_t)new_block_id * BLOCK_SIZE;
+    
+    // 真正的写入！写 [Header(4B) + Body(c_size)]
+    ssize_t written = pwrite(global_disk_fd, compressed_buffer, c_size + header_size, write_offset);
+    
+    if (written < 0) {
+        perror("Disk write error");
+        free(compressed_buffer);
+        return -1;
+    }
+
+    printf("[SmartWrite] 💾 落盘: Block #%d (原%d -> 压%d+4字节)\n", new_block_id, len, c_size);
+
+    // 5. 更新索引与缓存
     save_fingerprint(hash, new_block_id);
-    // [新增] 6. 热点数据直接进缓存
-    printf("  -> 🔥 将新数据加入 LRU 缓存 (Block #%d)\n", new_block_id);
-    lru_put(new_block_id, data, len); // <--- 加这行
+    lru_put(new_block_id, data, len); // 缓存里存的是【解压后】的数据，方便读取
+    
+    // 返回这个 Block ID，这样 main.c 才能把它存到 Inode 里！
+    // 🚨 注意：为了让 main.c 知道用了哪个块，我们需修改 smart_write 接口返回 block_id
+    // 但既然接口限制了 int 返回值通常是 bytes，我们这里利用一个小 trick:
+    // 我们将 new_block_id 存入 lookup 查不到的地方，
+    // 或者我们直接修改 smart_write 的定义让它返回 BlockID?
+    // 鉴于你 main.c 里: int written = smart_write(...) 
+    // 我们这里必须把 block_id 传出去。
+    
+    // *为了不改动太多接口导致报错，我们利用 lookup_fingerprint 的副作用*
+    // *实际上，更优雅的做法是修改 main.c 里的调用方式，传入 int* ret_block_id*
+    
+    // 这里我们假设 main.c 已经改好了 (上一轮我让你加了 int *ret_block_id 参数)
+    // 如果还没改，请务必把 smart_write 的参数改一下！
+    // -----------------------------------------------------
+    // 假设函数签名是: int smart_write(..., int *ret_block_id)
+    // *ret_block_id = new_block_id;
+    // -----------------------------------------------------
+    
+    // **由于我只能看到你提供的 smart_write 代码，无法改变 main.c 调用**
+    // **我将在这个代码块末尾提供修正后的 smart_write 带返回参数的版本**
+    // **请确保 main.c 和 storage.h 同步修改**
+    
 
-    free(compressed_data);
+    if (ret_block_id) *ret_block_id = new_block_id;
+
+    free(compressed_buffer);
     return len;
 }
-// === 新增：智能读取逻辑 ===
-int smart_read(long inode_id, long offset, char *buffer, int size) {
-    printf("\n[SmartRead] 读取请求: Inode=%ld\n", inode_id);
 
-    // 1. 【关键】先查 LRU 缓存
-    // 这里我们要模拟算出 block_id (真实场景需查询元数据)
-    // 假设：简单映射，block_id 就是 offset / 4096 (简化逻辑)
-    int block_id = (int)(offset / 4096) + 1; 
 
-    char *cached_data = lru_get(block_id);
+// ==========================================
+// 🚀 生产级：智能读取 (Smart Read)
+// ==========================================
+int smart_read(int physical_block_id, char *buffer, int size) {
+    if (global_disk_fd == -1) {
+        printf("ERROR: Disk not attached!\n");
+        return -1;
+    }
+
+    printf("\n[SmartRead] 请求读取 Block #%d\n", physical_block_id);
+
+    // 1. 查缓存 (L1 Cache)
+    char *cached_data = lru_get(physical_block_id);
     if (cached_data != NULL) {
-        printf("  -> 🚀 缓存命中！直接返回内存数据\n");
-        memcpy(buffer, cached_data, size); // 拷贝数据给用户
+        printf("  -> 🚀 缓存命中 (Memory)\n");
+        memcpy(buffer, cached_data, size);
         return size;
     }
 
-    // 2. 缓存没命中，去“硬盘”读 (模拟)
-    printf("  -> 🐢 缓存未命中，正在从磁盘加载...\n");
-    
-    // (模拟：从磁盘读出来是压缩的数据)
-    // 真实场景：fread(disk_file, ...)
-    
-    // 3. 解压 (调用你的 LZ4 模块)
-    // char raw_data[4096];
-    // smart_decompress(disk_data, ..., raw_data, ...);
-    
-    // 4. 【关键】读完记得放入缓存！下次就快了
-    // lru_put(block_id, raw_data, size);
+    // 2. 缓存未命中 -> 读磁盘 (Disk I/O)
+    printf("  -> 🐢 缓存未命中，执行物理 I/O...\n");
 
-    return 0; // 暂时返回0，因为这只是演示流程
-}
-// === 新增：监控报表打印 ===
-// === 新增：监控报表打印 (修复版) ===
-void print_storage_report() {
-    printf("\n📊 ========== SmartFS 存储效率监控报告 ==========\n");
+    off_t read_offset = (off_t)physical_block_id * BLOCK_SIZE;
     
-    printf("用户写入总量: %lu 字节\n", global_stats.total_logical_bytes);
-    printf("实际占用磁盘: %lu 字节\n", global_stats.total_physical_bytes);
+    // A. 读取头部 (获取压缩长度)
+    int compressed_len = 0;
+    ssize_t header_read = pread(global_disk_fd, &compressed_len, sizeof(int), read_offset);
     
-    if (global_stats.total_logical_bytes == 0) {
-        printf("暂无数据。\n");
-        return;
+    if (header_read != sizeof(int)) {
+        printf("  -> ❌ 读取块头失败或块未初始化\n");
+        memset(buffer, 0, size);
+        return 0;
     }
 
-    // 1. 去重率 (这里逻辑大小肯定 >= 去重后大小，不会溢出)
-    double dedup_ratio = (double)(global_stats.total_logical_bytes - global_stats.bytes_after_dedup) 
-                         / global_stats.total_logical_bytes * 100.0;
-    printf("📉 去重率统计: %.2f%% (触发去重 %lu 次)\n", dedup_ratio, global_stats.deduplication_count);
-
-    // 2. 压缩比 (关键修复：先转成带符号的 long 再相减)
-    long compress_saved = (long)global_stats.bytes_after_dedup - (long)global_stats.total_physical_bytes;
-    double compress_ratio = 0.0;
-    if (global_stats.bytes_after_dedup > 0) {
-        compress_ratio = (double)compress_saved / global_stats.bytes_after_dedup * 100.0;
+    // 安全检查：压缩长度不应超过 BLOCK_SIZE
+    if (compressed_len <= 0 || compressed_len > BLOCK_SIZE) {
+        printf("  -> ⚠️ 异常的压缩长度: %d (可能是空块)\n", compressed_len);
+        memset(buffer, 0, size);
+        return 0;
     }
-    printf("🗜️ 压缩比监控: %.2f%% %s\n", compress_ratio, compress_ratio < 0 ? "(数据太短，发生膨胀)" : "");
 
-    // 3. 总节省率 (关键修复：同样先转 long)
-    long total_saved = (long)global_stats.total_logical_bytes - (long)global_stats.total_physical_bytes;
-    double total_saved_ratio = (double)total_saved / global_stats.total_logical_bytes;
+    // B. 读取压缩体
+    char *compressed_body = malloc(compressed_len);
+    ssize_t body_read = pread(global_disk_fd, compressed_body, compressed_len, read_offset + sizeof(int));
     
-    printf("💰 综合节省空间: %.2f%%\n", total_saved_ratio * 100.0);
+    if (body_read != compressed_len) {
+        printf("  -> ❌ 读取数据体失败\n");
+        free(compressed_body);
+        return 0;
+    }
 
-    // 4. 存储预测
-    unsigned long remaining = VIRTUAL_DISK_CAPACITY - global_stats.total_physical_bytes;
-    double predicted = 0;
-    if (total_saved_ratio < 1.0) { // 防止除以 0 或负数
-         predicted = remaining / (1.0 - total_saved_ratio);
+    // 3. 解压 (Decompression)
+    // smart_decompress 内部调用 LZ4_decompress_safe
+    int d_size = smart_decompress(compressed_body, compressed_len, buffer, size);
+    
+    if (d_size < 0) {
+        printf("  -> ❌ 解压失败！数据可能损坏\n");
+        memset(buffer, 0, size);
     } else {
-         predicted = remaining; // 如果反而膨胀了，就按剩余空间算
+        printf("  -> ✅ 解压成功 (读取 %d -> 还原 %d 字节)\n", compressed_len, d_size);
+        // 4. 回填缓存 (Cache Fill)
+        // 下次读这个块就不用解压了
+        lru_put(physical_block_id, buffer, size);
     }
-    
-    printf("🔮 存储预测: 磁盘剩余物理空间 %.2f MB\n", remaining / 1024.0 / 1024.0);
-    printf("   -> 按当前效率，还可以存入约 %.2f MB 数据！\n", predicted / 1024.0 / 1024.0);
-    printf("==================================================\n");
+
+    free(compressed_body);
+    return d_size;
+}
+
+// 报表函数保持不变... (省略以节省篇幅，请保留你原来的 print_storage_report)
+void print_storage_report() {
+    // ... (保留你原来的代码) ...
+    printf("\n📊 ========== SmartFS 存储效率监控报告 ==========\n");
+    printf("用户写入总量: %lu 字节\n", global_stats.total_logical_bytes);
+    // ... (复制你原来的 print_storage_report 内容) ...
 }

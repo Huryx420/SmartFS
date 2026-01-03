@@ -2,7 +2,7 @@
 #define SMARTFS_STORAGE_H
 
 #include <stddef.h> // 为了识别 size_t
-
+void storage_attach_disk(int fd);
 // === 模块 C 功能清单 ===
 
 // 1. 计算数据指纹 (来自 dedup.c)
@@ -21,14 +21,14 @@ int smart_decompress(const char *input, int input_len, char *output, int max_out
 // 智能写入函数 (总指挥)
 // 参数: inode_id(这是哪个文件的), offset(写在哪), data(数据), len(长度)
 // 返回: 实际写入的字节数
-int smart_write(long inode_id, long offset, const char *data, int len);
+int smart_write(long inode_id, long offset, const char *data, int len, int *ret_block_id);
 // === LRU 缓存接口 ===
 void lru_init(int capacity);
 void lru_put(int block_id, const char *data, int len);
 char* lru_get(int block_id);
 // 智能读取函数
 // 返回：实际读取的字节数
-int smart_read(long inode_id, long offset, char *buffer, int size);
+int smart_read(int physical_block_id, char *buffer, int size);
 // === 模块 C 监控接口 (新增) ===
 
 typedef struct {
