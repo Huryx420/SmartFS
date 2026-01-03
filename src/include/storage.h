@@ -29,4 +29,15 @@ char* lru_get(int block_id);
 // 智能读取函数
 // 返回：实际读取的字节数
 int smart_read(long inode_id, long offset, char *buffer, int size);
+// === 模块 C 监控接口 (新增) ===
+
+typedef struct {
+    unsigned long total_logical_bytes;   // 用户以为他存了多少 (逻辑大小)
+    unsigned long bytes_after_dedup;     // 去重后剩下多少
+    unsigned long total_physical_bytes;  // 压缩后实际占硬盘多少 (物理大小)
+    unsigned long deduplication_count;   // 触发去重的次数
+} StorageStats;
+
+// 打印监控报表
+void print_storage_report();
 #endif
