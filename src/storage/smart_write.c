@@ -2,7 +2,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include "storage.h" // 包含你的哈希和压缩接口
-
+// 定义全局统计数据的初始状态
+StorageStats global_stats = {0, 0, 0, 0};
+// 假设我们的虚拟磁盘总容量是 100MB (用于预测功能)
+#define VIRTUAL_DISK_CAPACITY (100 * 1024 * 1024)
 // 模拟一个简单的“去重数据库”
 // 在真实项目中，这里应该用 B+ 树或者数据库文件
 typedef struct {
@@ -36,6 +39,7 @@ void save_fingerprint(const char *hash, int block_id) {
 
 // === 你的核心任务：smart_write ===
 int smart_write(long inode_id, long offset, const char *data, int len) {
+    global_stats.total_logical_bytes += len;
     printf("\n[SmartWrite] 收到写入请求: Inode=%ld, 大小=%d 字节\n", inode_id, len);
 
     // 1. 计算指纹 (调用你之前的代码)
@@ -50,6 +54,7 @@ int smart_write(long inode_id, long offset, const char *data, int len) {
         // === 情况 A: 数据重复了 ===
         printf("  -> 发现重复数据！引用已有块 Block #%d\n", existing_block);
         printf("  -> 节省空间: %d 字节 (未执行磁盘写入)\n", len);
+        global_stats.deduplication_count++;
         // 这里实际上应该增加引用计数 (Reference Count)
         return len;
     } 
@@ -60,6 +65,11 @@ int smart_write(long inode_id, long offset, const char *data, int len) {
     // 3. 压缩 (调用你之前的代码)
     char *compressed_data = malloc(len + 100);
     int c_size = smart_compress(data, len, compressed_data);
+    // 找到 smart_compress 那一行
+    // 在它后面（或者 save_fingerprint 附近）加这两行：
+
+    global_stats.bytes_after_dedup += len;        // 记录去重后的量
+    global_stats.total_physical_bytes += c_size;  // 记录压缩后的量
     
     // 4. 落盘 (模拟写入物理文件)
     // 在真实代码中，这里是用 fopen/fwrite 把 compressed_data 写进一个叫 data_blocks 的文件
@@ -105,4 +115,49 @@ int smart_read(long inode_id, long offset, char *buffer, int size) {
     // lru_put(block_id, raw_data, size);
 
     return 0; // 暂时返回0，因为这只是演示流程
+}
+// === 新增：监控报表打印 ===
+// === 新增：监控报表打印 (修复版) ===
+void print_storage_report() {
+    printf("\n📊 ========== SmartFS 存储效率监控报告 ==========\n");
+    
+    printf("用户写入总量: %lu 字节\n", global_stats.total_logical_bytes);
+    printf("实际占用磁盘: %lu 字节\n", global_stats.total_physical_bytes);
+    
+    if (global_stats.total_logical_bytes == 0) {
+        printf("暂无数据。\n");
+        return;
+    }
+
+    // 1. 去重率 (这里逻辑大小肯定 >= 去重后大小，不会溢出)
+    double dedup_ratio = (double)(global_stats.total_logical_bytes - global_stats.bytes_after_dedup) 
+                         / global_stats.total_logical_bytes * 100.0;
+    printf("📉 去重率统计: %.2f%% (触发去重 %lu 次)\n", dedup_ratio, global_stats.deduplication_count);
+
+    // 2. 压缩比 (关键修复：先转成带符号的 long 再相减)
+    long compress_saved = (long)global_stats.bytes_after_dedup - (long)global_stats.total_physical_bytes;
+    double compress_ratio = 0.0;
+    if (global_stats.bytes_after_dedup > 0) {
+        compress_ratio = (double)compress_saved / global_stats.bytes_after_dedup * 100.0;
+    }
+    printf("🗜️ 压缩比监控: %.2f%% %s\n", compress_ratio, compress_ratio < 0 ? "(数据太短，发生膨胀)" : "");
+
+    // 3. 总节省率 (关键修复：同样先转 long)
+    long total_saved = (long)global_stats.total_logical_bytes - (long)global_stats.total_physical_bytes;
+    double total_saved_ratio = (double)total_saved / global_stats.total_logical_bytes;
+    
+    printf("💰 综合节省空间: %.2f%%\n", total_saved_ratio * 100.0);
+
+    // 4. 存储预测
+    unsigned long remaining = VIRTUAL_DISK_CAPACITY - global_stats.total_physical_bytes;
+    double predicted = 0;
+    if (total_saved_ratio < 1.0) { // 防止除以 0 或负数
+         predicted = remaining / (1.0 - total_saved_ratio);
+    } else {
+         predicted = remaining; // 如果反而膨胀了，就按剩余空间算
+    }
+    
+    printf("🔮 存储预测: 磁盘剩余物理空间 %.2f MB\n", remaining / 1024.0 / 1024.0);
+    printf("   -> 按当前效率，还可以存入约 %.2f MB 数据！\n", predicted / 1024.0 / 1024.0);
+    printf("==================================================\n");
 }

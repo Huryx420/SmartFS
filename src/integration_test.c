@@ -22,6 +22,7 @@ int main() {
     char read_buf[100];
     // 这里的 offset 0 对应我们在 smart_read 里模拟的 block_id 1
     smart_read(101, 0, read_buf, len); 
+    print_storage_report();
 
     return 0;
 }
