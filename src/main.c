@@ -245,7 +245,7 @@ static int smartfs_getattr(const char *path, struct stat *stbuf, struct fuse_fil
     load_inode(inode_id, &inode);
 
     stbuf->st_mode = inode.mode;
-    stbuf->st_nlink = 1;
+    stbuf->st_nlink = inode.link_count; // <--- 从 Inode 读取真实计数！
     stbuf->st_size = inode.versions[0].file_size;
     stbuf->st_uid = inode.uid;
     stbuf->st_gid = inode.gid;
@@ -333,6 +333,7 @@ static int smartfs_create(const char *path, mode_t mode, struct fuse_file_info *
 
     inode_t new_inode;
     memset(&new_inode, 0, sizeof(inode_t));
+    new_inode.link_count = 1;
     new_inode.inode_id = new_inode_id;
     new_inode.mode = mode | S_IFREG; 
     new_inode.uid = getuid();
@@ -451,10 +452,11 @@ static int smartfs_read(const char *path, char *buf, size_t size, off_t offset,
 }
 
 // 6. 删除文件 (unlink)
+// 6. 删除文件 (unlink) - 升级版：支持硬链接计数
 static int smartfs_unlink(const char *path) {
     printf("DEBUG: Unlink %s\n", path);
     
-    // 解析路径
+    // 1. 解析路径
     char full_path[MAX_FILENAME];
     strncpy(full_path, path + 1, MAX_FILENAME - 1);
     full_path[MAX_FILENAME - 1] = '\0';
@@ -472,15 +474,31 @@ static int smartfs_unlink(const char *path) {
         if (parent_id == 0) return -ENOENT;
     }
 
-    // 查找目标
+    // 2. 找到目标 Inode
     uint64_t target_id = find_entry_in_dir(parent_id, file_name);
     if (target_id == 0) return -ENOENT;
 
-    // 从目录移除
+    // 3. 从目录中移除条目 (名字没了)
     if (remove_dir_entry(parent_id, file_name) != 0) return -ENOENT;
 
-    // 回收
-    free_inode(target_id);
+    // 4. 【核心修改】减少链接计数
+    inode_t inode;
+    load_inode(target_id, &inode);
+    
+    if (inode.link_count > 0) {
+        inode.link_count--;
+    }
+
+    if (inode.link_count == 0) {
+        // 只有没人引用了，才真正回收
+        printf("DEBUG: Link count is 0, freeing inode %lu\n", target_id);
+        free_inode(target_id);
+    } else {
+        // 还有别的文件名指向它，只保存计数更新
+        printf("DEBUG: Link count is %u, keeping inode %lu\n", inode.link_count, target_id);
+        save_inode(&inode);
+    }
+    
     return 0;
 }
 
@@ -533,6 +551,7 @@ static int smartfs_mkdir(const char *path, mode_t mode) {
 
     inode_t new_inode;
     memset(&new_inode, 0, sizeof(inode_t));
+    new_inode.link_count = 2;
     new_inode.inode_id = new_inode_id;
     new_inode.mode = S_IFDIR | mode;
     new_inode.uid = getuid();
@@ -604,7 +623,166 @@ static int smartfs_rmdir(const char *path) {
     free_inode(inode_id);
     return 0;
 }
+static int smartfs_link(const char *from, const char *to) {
+    printf("DEBUG: Link %s -> %s\n", from, to);
+    
+    // 1. 找到源文件的 Inode
+    uint64_t inode_id = resolve_path_to_inode(from);
+    if (inode_id == 0) return -ENOENT;
 
+    // 2. 解析目标路径 (确定要把名字加到哪个目录)
+    char full_path[MAX_FILENAME];
+    strncpy(full_path, to + 1, MAX_FILENAME - 1);
+    full_path[MAX_FILENAME - 1] = '\0';
+    
+    char *dir_name = NULL;
+    char *file_name = full_path;
+    uint64_t parent_inode_id = 0; 
+
+    char *slash = strchr(full_path, '/');
+    if (slash) {
+        *slash = '\0';
+        dir_name = full_path;
+        file_name = slash + 1;
+        parent_inode_id = find_entry_in_dir(0, dir_name);
+        if (parent_inode_id == 0) return -ENOENT;
+    }
+
+    // 3. 增加 Inode 计数
+    inode_t inode;
+    load_inode(inode_id, &inode);
+    inode.link_count++;
+    save_inode(&inode);
+
+    // 4. 在目录中添加新条目 (指向同一个 ID)
+    return add_dir_entry(parent_inode_id, file_name, inode_id);
+}
+static int smartfs_rename(const char *from, const char *to, unsigned int flags) {
+    (void) flags; // 忽略 flags
+    printf("DEBUG: Rename %s -> %s\n", from, to);
+
+    // 1. 找到源 Inode
+    uint64_t inode_id = resolve_path_to_inode(from);
+    if (inode_id == 0) return -ENOENT;
+
+    // 2. 解析目标路径 (新爸爸是谁？)
+    char to_path_copy[MAX_FILENAME];
+    strncpy(to_path_copy, to + 1, MAX_FILENAME - 1);
+    
+    char *new_dir_name = NULL;
+    char *new_file_name = to_path_copy;
+    uint64_t new_parent_id = 0;
+
+    char *slash = strchr(to_path_copy, '/');
+    if (slash) {
+        *slash = '\0';
+        new_dir_name = to_path_copy;
+        new_file_name = slash + 1;
+        new_parent_id = find_entry_in_dir(0, new_dir_name);
+        if (new_parent_id == 0) return -ENOENT;
+    }
+
+    // 3. 解析源路径 (旧爸爸是谁？为了删除旧条目)
+    char from_path_copy[MAX_FILENAME];
+    strncpy(from_path_copy, from + 1, MAX_FILENAME - 1);
+    char *old_dir_name = NULL;
+    char *old_file_name = from_path_copy;
+    uint64_t old_parent_id = 0;
+
+    slash = strchr(from_path_copy, '/');
+    if (slash) {
+        *slash = '\0';
+        old_dir_name = from_path_copy;
+        old_file_name = slash + 1;
+        old_parent_id = find_entry_in_dir(0, old_dir_name);
+    }
+
+    // 4. 添加新条目 (指向同一个 inode_id)
+    if (add_dir_entry(new_parent_id, new_file_name, inode_id) != 0) {
+        return -ENOSPC;
+    }
+
+    // 5. 删除旧条目
+    remove_dir_entry(old_parent_id, old_file_name);
+    
+    return 0;
+}
+static int smartfs_symlink(const char *to, const char *from) {
+    printf("DEBUG: Symlink %s -> %s\n", from, to);
+    
+    // 1. 创建一个新文件 (复用 create 逻辑，但在 create 里很难传内容)
+    // 所以这里我们需要手动走一遍 create 流程，但 mode 设置为 S_IFLNK
+    
+    // 解析 'from' 路径 (这是软链接文件的名字)
+    char full_path[MAX_FILENAME];
+    strncpy(full_path, from + 1, MAX_FILENAME - 1);
+    char *dir_name = NULL;
+    char *file_name = full_path;
+    uint64_t parent_id = 0;
+    
+    char *slash = strchr(full_path, '/');
+    if (slash) {
+        *slash = '\0';
+        dir_name = full_path;
+        file_name = slash + 1;
+        parent_id = find_entry_in_dir(0, dir_name);
+    }
+
+    // 分配 Inode
+    uint64_t new_inode_id = allocate_inode();
+    if (new_inode_id == 0) return -ENOSPC;
+
+    // 初始化 Inode (关键：S_IFLNK)
+    inode_t new_inode;
+    memset(&new_inode, 0, sizeof(inode_t));
+    new_inode.inode_id = new_inode_id;
+    new_inode.mode = S_IFLNK | 0777; // 符号链接通常是 777
+    new_inode.uid = getuid();
+    new_inode.gid = getgid();
+    new_inode.link_count = 1;
+    new_inode.versions[0].version_id = 1;
+    new_inode.versions[0].timestamp = time(NULL);
+
+    // 分配数据块存路径
+    uint64_t block_id = allocate_block();
+    new_inode.versions[0].block_list_start_index = block_id;
+    new_inode.versions[0].block_count = 1;
+    size_t path_len = strlen(to);
+    new_inode.versions[0].file_size = path_len;
+
+    // 写入目标路径到数据块
+    lseek(disk_fd, block_id * BLOCK_SIZE, SEEK_SET);
+    write(disk_fd, to, path_len + 1); // +1 把 \0 也写进去
+
+    save_inode(&new_inode);
+    
+    // 添加到目录
+    return add_dir_entry(parent_id, file_name, new_inode_id);
+}
+static int smartfs_readlink(const char *path, char *buf, size_t size) {
+    printf("DEBUG: Readlink %s\n", path);
+    
+    uint64_t inode_id = resolve_path_to_inode(path);
+    if (inode_id == 0) return -ENOENT;
+
+    inode_t inode;
+    load_inode(inode_id, &inode);
+
+    if (!S_ISLNK(inode.mode)) return -EINVAL;
+
+    uint64_t block_id = inode.versions[0].block_list_start_index;
+    
+    // 读取数据块
+    char disk_buf[BLOCK_SIZE];
+    lseek(disk_fd, block_id * BLOCK_SIZE, SEEK_SET);
+    read(disk_fd, disk_buf, BLOCK_SIZE);
+    
+    // 复制到用户 buffer
+    strncpy(buf, disk_buf, size - 1);
+    buf[size - 1] = '\0';
+    
+    return 0;
+}
 static int smartfs_open(const char *path, struct fuse_file_info *fi) {
     (void) path; // <--- 新增：告诉编译器忽略 path
     (void) fi;   // <--- 新增：告诉编译器忽略 fi
@@ -634,6 +812,10 @@ static const struct fuse_operations smartfs_oper = {
     .truncate = smartfs_truncate,
     .mkdir    = smartfs_mkdir,
     .rmdir    = smartfs_rmdir,
+    .rename     = smartfs_rename,
+    .link       = smartfs_link,
+    .symlink    = smartfs_symlink,
+    .readlink   = smartfs_readlink,
 };
 
 // =========================================================

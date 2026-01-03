@@ -62,7 +62,7 @@ typedef struct {
     uint32_t gid;                // 组ID
     uint32_t latest_version;     // 当前最新版本号
     uint32_t total_versions;     // 历史版本总数
-    
+    uint32_t link_count;
     // 版本链表/数组：指向该文件的所有历史版本
     // 这里简单化处理，实际可能需要单独的元数据区存储版本信息
     file_version_t versions[MAX_VERSIONS]; 
