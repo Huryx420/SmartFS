@@ -33,6 +33,8 @@ add_executable(smartfs
     src/storage/compress.c
     src/storage/dedup.c
     src/storage/smart_write.c
+    src/storage/backup.c
+    src/storage/wal.c
 )
 
 # 链接库 (强制直接链接 lz4)

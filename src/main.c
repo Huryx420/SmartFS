@@ -20,6 +20,11 @@
 static int disk_fd = -1;
 static super_block_t sb;
 static const char *disk_path = "test.img";
+void wal_init();
+void wal_begin(const char *op_name);
+void wal_log_write(int block_id, uint32_t checksum);
+void wal_commit();
+int backup_create(const char *backup_file, int is_full);
 
 // =========================================================
 // Level 1: 基础磁盘操作 (必须放在最前面)
@@ -227,6 +232,7 @@ uint64_t resolve_path_to_inode(const char *path) {
 // =========================================================
 
 // 1. 获取文件属性 (getattr)
+// 1. 获取文件属性 (getattr)
 static int smartfs_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi) {
     (void) fi;
     memset(stbuf, 0, sizeof(struct stat));
@@ -237,48 +243,49 @@ static int smartfs_getattr(const char *path, struct stat *stbuf, struct fuse_fil
         return 0;
     }
 
-    // 1. 解析路径看看有没有带版本号
+    // --- [模块 B] 新版本逻辑开始 ---
     char real_path[MAX_FILENAME];
     int version_id = 0;
-    char time_str[32] = {0}; // [新增]
-// [修改] 调用新接口
+    char time_str[32] = {0}; 
+    // 1. 调用新接口解析 @v1 或 @2h
     version_query_type_t query_type = parse_version_path(path, real_path, &version_id, time_str);
-
+    
+    // ⚠️ 删除旧变量：int has_version ...
+    
     uint64_t inode_id = resolve_path_to_inode(path);
     if (inode_id == 0) return -ENOENT;
-    printf("DEBUG: getattr path=%s -> resolved_inode=%lu\n", path, inode_id);
-
+    
     inode_t inode;
     load_inode(inode_id, &inode);
 
-    // 2. 确定我们要读哪个版本
+    // 2. 确定我们要读哪个版本 (使用指针 file_version_t*)
     file_version_t *target_ver = NULL;
 
     if (query_type == VER_QUERY_ID) {
-        // @v1 模式
         target_ver = version_mgr_get_version(&inode, version_id);
     } 
     else if (query_type == VER_QUERY_TIME) {
-        // [新增] @2h 模式
         target_ver = version_mgr_find_by_time_str(&inode, time_str);
     } 
     else {
-        // 普通模式，取最新
-        target_ver = version_mgr_get_version(&inode, 0);
+        target_ver = version_mgr_get_version(&inode, 0); // 最新版
     }
 
-    if (!target_ver) return -ENOENT; // 找不到对应的历史版本
+    if (!target_ver) return -ENOENT; 
+
+    // ⚠️ 删除整个 target_idx / has_version 的 if-else 块
 
     // 3. 填充属性
     stbuf->st_ino = inode_id;
     stbuf->st_mode = inode.mode;
     stbuf->st_nlink = inode.link_count;
     
-    // [关键] 使用目标版本的大小和时间
+    // [关键] 只使用 target_ver 填充
     stbuf->st_size = target_ver->file_size;   
     stbuf->st_mtime = target_ver->timestamp;
     
-    // 如果是只读的历史快照，去掉写权限（可选优化）
+    // ⚠️ 删除后面那两行重复赋值 st_size/st_mtime 的旧代码
+
     if (query_type != VER_QUERY_NONE) {
         stbuf->st_mode &= ~0222; 
     }
@@ -405,97 +412,89 @@ static int smartfs_write(const char *path, const char *buf, size_t size,
     inode_t inode;
     load_inode(inode_id, &inode);
 
- int current_idx = inode.total_versions - 1;
+    int current_idx = inode.total_versions - 1;
     if (current_idx < 0) current_idx = 0;
 
-    // 🔴 [优化] 时间间隔策略：防止版本爆炸
-    // 只有当文件不为空，且距离上次快照超过 30 秒 (演示用) 时，才创建新快照
-    // 实际生产环境可能是 300秒 或 3600秒
+    // 🔴 [优化] 时间间隔策略
     int SNAPSHOT_INTERVAL = 30; 
     
     if (inode.versions[current_idx].file_size > 0) {
+        // 如果满足时间间隔，且文件不为空，则创建快照
         if (version_mgr_should_snapshot(&inode, SNAPSHOT_INTERVAL)) {
-            printf("DEBUG: Time strategy triggered (interval > %ds). Creating snapshot...\n", SNAPSHOT_INTERVAL);
-            
-            // 尝试创建快照，如果被 Pin 满了可能会失败，但不应阻止写入
+            printf("DEBUG: Time strategy triggered. Creating snapshot...\n");
             int res = version_mgr_create_snapshot(&inode, "Auto-save (Time Triggered)");
             if (res < 0) {
-                 printf("WARNING: Snapshot failed (Pinned?), proceeding with write in current version.\n");
+                 printf("WARNING: Snapshot failed (Pinned?), writing to current version.\n");
             }
         } else {
-            printf("DEBUG: Write inside interval (<%ds), updating current version directly.\n", SNAPSHOT_INTERVAL);
+            printf("DEBUG: Write inside interval (<%ds), updating current version.\n", SNAPSHOT_INTERVAL);
         }
-    }
+    } 
+    // 注意：这里删除了你代码中那个重复的 "if (inode.versions[current_idx].file_size > 0)" 块
+    // 因为上面的逻辑已经涵盖了快照判断
 
     // ---------------------------------------------------------
     // 步骤 A: 准备缓冲区 (Read-Modify-Write)
     // ---------------------------------------------------------
-    // 我们需要一个完整的块大小缓冲区，用来合并旧数据和新数据
     char merge_buffer[BLOCK_SIZE];
     memset(merge_buffer, 0, BLOCK_SIZE);
 
-    // 获取当前最新版本 (v0) 的旧数据块 ID
     int latest_idx = inode.total_versions - 1;
     int old_block_id = inode.versions[latest_idx].block_list_start_index;
     int old_size = inode.versions[latest_idx].file_size;
 
-    // 如果旧文件有内容，先读出来！(这是追加写入的关键)
-if (old_block_id > 0 && old_size > 0) {
-    // ✅ 修正：补上 inode_id，并将 old_block_id 作为第二个参数(offset)传入
-    smart_read((long)inode_id, (long)old_block_id, merge_buffer, BLOCK_SIZE);
-}
+    if (old_block_id > 0 && old_size > 0) {
+        smart_read((long)inode_id, (long)old_block_id, merge_buffer, BLOCK_SIZE);
+    }
 
     // ---------------------------------------------------------
     // 步骤 B: 合并数据
     // ---------------------------------------------------------
-    // 检查是否越界 (简化版：仅支持单块 4KB)
     if (offset + size > BLOCK_SIZE) {
-        return -EFBIG; // 文件太大，超过 demo 限制
+        return -EFBIG; 
     }
 
-    // 将用户的新数据 memcpy 到 merge_buffer 的指定偏移位置
-    // 这实现了覆盖或追加：
-    // - 覆盖：offset=0, memcpy 覆盖开头
-    // - 追加：offset=old_size, memcpy 接在后面
     memcpy(merge_buffer + offset, buf, size);
 
-    // 计算新的文件总大小
     int new_total_size = offset + size;
-    if (new_total_size < old_size) new_total_size = old_size; // 如果是中间修改，大小可能不变
+    if (new_total_size < old_size) new_total_size = old_size;
 
     // ---------------------------------------------------------
-    // 步骤 C: 写入新块
+    // 步骤 C: 写入新块 (集成 WAL)
     // ---------------------------------------------------------
     int physical_block_id = 0;
 
-    // 调用 Module C，写入合并后的完整块
-    // 注意：这里传入的是 merge_buffer，大小是 new_total_size (或者 BLOCK_SIZE，取决于你的存储层设计)
-    // 为了更精确的去重，我们传入实际有效数据长度
+    // [WAL] 1. 开启事务
+    wal_begin("Write Data Block");
+
+    // 2. 执行写入
     int written = smart_write((long)inode_id, 0, merge_buffer, new_total_size, &physical_block_id);
     
     if (written < 0) {
         return -EIO;
     }
 
+    // [WAL] 3. 记日志
+    if (physical_block_id > 0) {
+        wal_log_write(physical_block_id, 0); 
+    }
+
+    // [WAL] 4. 提交事务
+    wal_commit();
+
     // ---------------------------------------------------------
     // 步骤 D: 更新元数据
     // ---------------------------------------------------------
-    // 将返回的 Block ID 存入 v0
     if (physical_block_id > 0) {
         inode.versions[latest_idx].block_list_start_index = physical_block_id;
         inode.versions[latest_idx].block_count = 1; 
     }
 
-    // 更新文件大小和时间
     inode.versions[latest_idx].file_size = new_total_size;
-    if (latest_idx != current_idx || inode.versions[latest_idx].timestamp == 0) {
     inode.versions[latest_idx].timestamp = time(NULL);
-}
 
-    // 保存 Inode
     save_inode(&inode);
 
-    // 告诉 FUSE 我们成功写入了用户请求的 size 字节
     return size;
 }
 static int smartfs_read(const char *path, char *buf, size_t size, 
@@ -506,7 +505,7 @@ static int smartfs_read(const char *path, char *buf, size_t size,
     // 1. 解析路径与版本
     char real_path[MAX_FILENAME];
     int version_id = 0; 
-    char time_str[32] = {0}; // [新增] 用于接收时间字符串
+    char time_str[32] = {0}; 
 
     version_query_type_t query_type = parse_version_path(path, real_path, &version_id, time_str);
 
@@ -519,29 +518,23 @@ static int smartfs_read(const char *path, char *buf, size_t size,
     file_version_t *v = NULL;
 
     if (query_type == VER_QUERY_ID) {
-        // 情况 A: 用户指定了 @v1
         v = version_mgr_get_version(&inode, version_id);
     } 
     else if (query_type == VER_QUERY_TIME) {
-        // 情况 B: 用户指定了 @2h
         v = version_mgr_find_by_time_str(&inode, time_str);
     } 
     else {
-        // 情况 C: 普通读取，获取最新版本
         v = version_mgr_get_version(&inode, 0);
     }
+    
     if (!v) return -ENOENT;
 
-    // =================================================
-    // [关键修复 A] 检查 EOF (End Of File)
-    // 如果读取位置超过了文件实际大小，直接返回 0
-    // =================================================
+    // [检查 EOF]
     if (offset >= v->file_size) {
         return 0;
     }
 
-    // [关键修复 B] 截断读取长度
-    // 比如文件剩 5 字节，用户想读 100 字节，那只能给 5 字节
+    // [截断读取长度]
     if (offset + size > v->file_size) {
         size = v->file_size - offset;
     }
@@ -549,30 +542,21 @@ static int smartfs_read(const char *path, char *buf, size_t size,
     int physical_block_id = v->block_list_start_index;
     if (physical_block_id == 0) return 0;
 
-    // =================================================
-    // [关键修复 C] 处理块内偏移 (Block Offset)
-    // smart_read 会解压 *整个* 4KB 块，我们不能直接写到用户 buf 里，
-    // 否则 offset > 0 时，用户会错误地读到文件开头的数据。
-    // =================================================
+    // [块内读取]
+    char temp_block[BLOCK_SIZE]; 
     
-    char temp_block[BLOCK_SIZE]; // 在栈上申请 4KB 临时空间
-    
-    // 1. 把整个块解压到临时 buffer
-   // ✅ 修正：补上 inode_id，并将 physical_block_id 作为第二个参数(offset)传入
+    // 使用 smart_read 读取解压
     int bytes_in_block = smart_read((long)inode_id, (long)physical_block_id, temp_block, BLOCK_SIZE);
     
     if (bytes_in_block <= 0) return 0;
 
-    // 2. 再次防御性检查
     if (offset >= bytes_in_block) return 0;
 
-    // 3. 计算本次能拷贝多少 (防止跨块读取时溢出，虽然目前逻辑是单块文件)
     size_t copy_len = size;
     if (offset + copy_len > bytes_in_block) {
         copy_len = bytes_in_block - offset;
     }
 
-    // 4. 从临时 buffer 的对应位置 (offset) 拷贝数据给用户
     memcpy(buf, temp_block + offset, copy_len);
 
     return copy_len;
@@ -629,8 +613,6 @@ static int smartfs_unlink(const char *path) {
     return 0;
 }
 
-// 7. 修改大小 (truncate)
-// [修改] 修复后的 smartfs_truncate
 static int smartfs_truncate(const char *path, off_t size, struct fuse_file_info *fi) {
     (void) fi;
     uint64_t inode_id = resolve_path_to_inode(path);
@@ -640,17 +622,16 @@ static int smartfs_truncate(const char *path, off_t size, struct fuse_file_info 
     load_inode(inode_id, &inode);
 
     // ---------------------------------------------------------
-    // 步骤 1: 找到当前的最新版本 (Append Mode 逻辑)
+    // 步骤 1: 找到当前的最新版本
     // ---------------------------------------------------------
     int current_idx = inode.total_versions - 1;
-    if (current_idx < 0) current_idx = 0; // 防御性代码
+    if (current_idx < 0) current_idx = 0; 
 
-// =========================================================
-    // 🔴 [修改] 在 Truncate 中也加入时间策略
     // =========================================================
-    int SNAPSHOT_INTERVAL = 30; // 必须与 write 中的保持一致，建议定义宏
+    // 🔴 [修改] Truncate 的时间策略
+    // =========================================================
+    int SNAPSHOT_INTERVAL = 30; 
 
-    // 原逻辑：if (inode.versions[current_idx].file_size > 0)
     if (inode.versions[current_idx].file_size > 0) {
         // 只有满足时间间隔，才创建快照
         if (version_mgr_should_snapshot(&inode, SNAPSHOT_INTERVAL)) {
@@ -659,37 +640,29 @@ static int smartfs_truncate(const char *path, off_t size, struct fuse_file_info 
             if (res < 0) printf("WARNING: Snapshot failed in truncate.\n");
         } else {
             printf("DEBUG: Truncate skipping snapshot (Time < %ds). Overwriting current version.\n", SNAPSHOT_INTERVAL);
-            // 这里不调用 snapshot，直接往下走，就会修改当前最新版本的 size
-            // 从而实现了“原地更新”，不产生新版本
         }
     }
+    // ⚠️ 之前这里少了一个大括号，导致后面的代码全乱套了
 
     // ---------------------------------------------------------
-    // 步骤 3: 重新定位最新版本
+    // 步骤 2: 更新最新版本信息
     // ---------------------------------------------------------
-    // 快照后，total_versions 增加了，最新的槽位变成了下一个
+    // 此时 total_versions 可能增加了，我们需要重新指向最新的位置
     int new_latest_idx = inode.total_versions - 1;
 
-    // ---------------------------------------------------------
-    // 步骤 4: [修复 Issue 2 的元数据部分] 修改新版本的大小
-    // ---------------------------------------------------------
+    // 更新大小
     inode.versions[new_latest_idx].file_size = size;
-    if (new_latest_idx != current_idx || inode.versions[new_latest_idx].timestamp == 0) {
     inode.versions[new_latest_idx].timestamp = time(NULL);
-}
-    // 必须同步更新 latest_version 指针和 ID，否则读取时会错乱 (和 write 修复逻辑一致)
-    inode.latest_version = inode.total_versions; 
-    inode.versions[new_latest_idx].version_id = inode.latest_version;
-   if (size == 0) {
-        // 1. 告诉系统这个版本现在有 0 个块
+    
+    // 同步更新 Inode 层的指针
+    inode.latest_version = inode.versions[new_latest_idx].version_id;
+
+    // 特殊情况：如果是截断为 0，清空块引用
+    if (size == 0) {
         inode.versions[new_latest_idx].block_count = 0;
-        
-        // 2. 将块列表索引指向无效值 (通常 0 或 -1，视你的实现而定，这里设为 0 安全)
-        // 这样 smartfs_write 里的 get_block_id 就找不到旧块了
         inode.versions[new_latest_idx].block_list_start_index = 0;
-        
         printf("DEBUG: Truncate to 0 -> Reset block_count to 0.\n");
-   }
+    }
 
     save_inode(&inode);
     return 0;
@@ -888,15 +861,23 @@ static int smartfs_rename(const char *from, const char *to, unsigned int flags) 
     
     return 0;
 }
-static int smartfs_symlink(const char *to, const char *from) {
-    printf("DEBUG: Symlink %s -> %s\n", from, to);
+// [修复] 修正参数顺序和变量名，符合 FUSE 3 标准
+// to = 链接的名字 (例如 /soft_link.txt)
+// from = 链接指向的目标 (例如 ../subdir/moved_hello.txt)
+// [修复] 严格符合 FUSE 3 定义：symlink(target, linkpath)
+// target   = 链接指向的目标 (例如 "../subdir/moved_hello.txt")
+// linkpath = 链接本身的路径 (例如 "/soft_link.txt")
+static int smartfs_symlink(const char *target, const char *linkpath) {
+    printf("DEBUG: Symlink target=%s <- linkpath=%s\n", target, linkpath);
     
-    // 1. 创建一个新文件 (复用 create 逻辑，但在 create 里很难传内容)
-    // 所以这里我们需要手动走一遍 create 流程，但 mode 设置为 S_IFLNK
-    
-    // 解析 'from' 路径 (这是软链接文件的名字)
+    // 1. 解析 linkpath，分离出父目录和文件名
     char full_path[MAX_FILENAME];
-    strncpy(full_path, from + 1, MAX_FILENAME - 1);
+    memset(full_path, 0, MAX_FILENAME);
+    // 去掉开头的 '/'
+    const char *rel_path = linkpath;
+    if (rel_path[0] == '/') rel_path++;
+    strncpy(full_path, rel_path, MAX_FILENAME - 1);
+    
     char *dir_name = NULL;
     char *file_name = full_path;
     uint64_t parent_id = 0;
@@ -906,39 +887,62 @@ static int smartfs_symlink(const char *to, const char *from) {
         *slash = '\0';
         dir_name = full_path;
         file_name = slash + 1;
+        
+        // 查找父目录 Inode
         parent_id = find_entry_in_dir(0, dir_name);
+        if (parent_id == 0) {
+            printf("DEBUG: Parent dir '%s' not found for symlink.\n", dir_name);
+            return -ENOENT;
+        }
     }
 
-    // 分配 Inode
+    // 2. 分配 Inode
     uint64_t new_inode_id = allocate_inode();
-    if (new_inode_id == 0) return -ENOSPC;
+    if (new_inode_id == 0) {
+        printf("DEBUG: Failed to allocate inode for symlink.\n");
+        return -ENOSPC;
+    }
 
-    // 初始化 Inode (关键：S_IFLNK)
+    // 3. 初始化 Inode (关键：S_IFLNK)
     inode_t new_inode;
     memset(&new_inode, 0, sizeof(inode_t));
     new_inode.inode_id = new_inode_id;
-    new_inode.mode = S_IFLNK | 0777; // 符号链接通常是 777
+    new_inode.mode = S_IFLNK | 0777; // 软链接权限通常是 777
     new_inode.uid = getuid();
     new_inode.gid = getgid();
     new_inode.link_count = 1;
+    new_inode.total_versions = 1;
+    new_inode.latest_version = 1;
     new_inode.versions[0].version_id = 1;
     new_inode.versions[0].timestamp = time(NULL);
 
-    // 分配数据块存路径
+    // 4. 分配数据块，写入 target 路径
     uint64_t block_id = allocate_block();
+    if (block_id == 0) return -ENOSPC;
+
     new_inode.versions[0].block_list_start_index = block_id;
     new_inode.versions[0].block_count = 1;
-    size_t path_len = strlen(to);
+    
+    // [修复] 这里必须计算 target 的长度，并写入 target 的内容！
+    size_t path_len = strlen(target);
     new_inode.versions[0].file_size = path_len;
 
     // 写入目标路径到数据块
     lseek(disk_fd, block_id * BLOCK_SIZE, SEEK_SET);
-    write(disk_fd, to, path_len + 1); // +1 把 \0 也写进去
+    write(disk_fd, target, path_len + 1); // +1 把 \0 也写进去
 
     save_inode(&new_inode);
     
-    // 添加到目录
-    return add_dir_entry(parent_id, file_name, new_inode_id);
+    // 5. 添加到目录
+    int ret = add_dir_entry(parent_id, file_name, new_inode_id);
+    if (ret != 0) {
+        printf("DEBUG: Failed to add dir entry: %d\n", ret);
+        // 回滚：释放 Inode (简单起见，这里仅打印日志)
+        return ret;
+    }
+    
+    printf("DEBUG: Symlink created successfully. Inode=%lu\n", new_inode_id);
+    return 0;
 }
 static int smartfs_readlink(const char *path, char *buf, size_t size) {
     printf("DEBUG: Readlink %s\n", path);
@@ -1069,6 +1073,28 @@ static int smartfs_setxattr(const char *path, const char *name, const char *valu
             return 0;
         }
         return -EINVAL;
+    }
+// [新增] 3. 备份接口 (Trigger Backup)
+    if (strcmp(name, "user.smartfs.backup") == 0) {
+        // --- 修复开始 ---
+        // 1. 安全拷贝 value，确保以 \0 结尾
+        char command[32];
+        memset(command, 0, 32);
+        size_t copy_len = (size < 31) ? size : 31;
+        memcpy(command, value, copy_len);
+        command[copy_len] = '\0'; // 强制截断，去掉乱码
+
+        printf("DEBUG: Backup Command Received: '%s'\n", command);
+
+        // 2. 比较字符串
+        int is_full = (strcmp(command, "full") == 0);
+        // --- 修复结束 ---
+
+        char backup_path[64];
+        sprintf(backup_path, "/tmp/smartfs_%ld.bak", time(NULL));
+        
+        backup_create(backup_path, is_full);
+        return 0;
     }
 
     // 1. 查找是否存在同名属性
@@ -1273,6 +1299,9 @@ int main(int argc, char *argv[]) {
     printf("[Init] Initializing LRU Cache (Capacity: 100 blocks)...\n");
     lru_init(100);  // <--- 加上这一行！分配100个块的缓存空间
     // ==========================================
+    // [新增] 初始化 WAL (检查是否有崩溃日志需要恢复) [cite: 1]
+    printf("[Init] Initializing Write-Ahead Logging (WAL)...\n");
+    wal_init();
 
     // 3. 启动 FUSE
     printf("[Init] Starting SmartFS...\n");

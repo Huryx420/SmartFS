@@ -1,4 +1,25 @@
+cat <<EOF > .gitignore
+# 忽略编译生成的文件
 build/
-.vscode/
-mnt/
+smartfs
+*.o
+
+# 忽略磁盘镜像 (太大了，不能传)
 *.img
+test.img
+
+# 忽略挂载点
+mountpoint/
+
+# 忽略运行时生成的临时文件
+/tmp/smartfs*
+*.wal
+*.bak
+*.cache
+*.data
+*.idx
+
+# 忽略编辑器配置
+.vscode/
+.idea/
+EOF
